@@ -1,0 +1,121 @@
+syntax = "proto3";
+
+package iapetus.v1;
+
+import "google/protobuf/timestamp.proto";
+import "iapetus/v1/common.proto";
+import "iapetus/v1/desktop.proto";   // Hello.os
+import "iapetus/v1/action.proto";
+import "iapetus/v1/event.proto";
+
+// PRD §19.5 iapetusd <-> Control Plane transport contract.
+//
+// The guest dials out and holds the stream open; the Control Plane sends actions
+// down that same stream rather than connecting inward. The guest therefore opens
+// no inbound port and holds no Control Plane API rights (§9.1).
+
+service DaemonChannel {
+  // One long-lived bidirectional stream per Desktop, multiplexing actions,
+  // responses, events, and heartbeats.
+  rpc Connect(stream GuestFrame) returns (stream ControlFrame);
+}
+
+// ── Guest -> Control Plane ────────────────────────────────
+message GuestFrame {
+  oneof body {
+    Hello hello = 1;
+    ActionResponse response = 2;
+    Event event = 3;
+    Heartbeat heartbeat = 4;
+    StreamChunk chunk = 5;
+  }
+}
+
+// ── Control Plane -> guest ────────────────────────────────
+message ControlFrame {
+  oneof body {
+    HelloAck hello_ack = 1;
+    ActionRequest request = 2;
+    Heartbeat heartbeat = 3;
+    Shutdown shutdown = 4;
+  }
+}
+
+// ── Version negotiation (PRD §19.4) ───────────────────────
+message Hello {
+  string daemon_version = 1;          // "1.7.2"
+  int32 protocol_min = 2;
+  int32 protocol_max = 3;
+  Os os = 4;
+  Display display = 5;
+}
+
+message HelloAck {
+  // Highest version both sides support. No overlap -> the Desktop goes DEGRADED
+  // and recovers on the next resume with a fresh daemon volume (§19.4).
+  int32 protocol = 1;
+  bool degraded = 2;
+  optional string degraded_reason = 3;
+  // PRD §7.4: after a restore the guest clock is stale, which breaks TLS session
+  // resumption and token expiry checks. Actions are held until resync completes.
+  bool require_clock_resync = 4;
+}
+
+// ── Actions ───────────────────────────────────────────────
+message ActionRequest {
+  uint64 id = 1;                      // unique within the connection only (§19.5)
+  Action action = 2;
+  int32 deadline_ms = 3;              // past this the guest drops the response;
+                                      // already-applied input is NOT undone (§8.2)
+  // PRD §7.5: distinguishes viewer-originated input, which the gateway forwards
+  // on this same stream. Used for audit actor attribution.
+  optional InputSource source = 4;
+}
+
+message InputSource {
+  enum Kind {
+    KIND_UNSPECIFIED = 0;
+    KIND_AGENT = 1;
+    KIND_VIEWER = 2;
+  }
+  Kind kind = 1;
+  string session_id = 2;
+}
+
+message ActionResponse {
+  uint64 id = 1;
+  ActionResult result = 2;
+}
+
+// ── Heartbeat ─────────────────────────────────────────────
+// Every 5s. Three consecutive misses (15s) -> DEGRADED; 60s -> runbook RB-1 (§12.2).
+message Heartbeat {
+  google.protobuf.Timestamp ts = 1;
+  // Observability hint only. The guest is root and can forge these, so billing
+  // and scheduling read hypervisor counters instead (§19.5).
+  double cpu_load = 2;
+  int64 mem_used_bytes = 3;
+  double capture_fps = 4;
+}
+
+// ── Stream chunks ─────────────────────────────────────────
+// shell.stream output, file transfer, and the §19.6 still overlay. The overlay
+// rides this control stream rather than the media path because a WebP cannot be
+// carried on the H.264 track and the gateway never decodes (§19.6).
+message StreamChunk {
+  uint64 id = 1;                      // correlates to the originating request
+  enum Kind {
+    KIND_UNSPECIFIED = 0;
+    KIND_STDOUT = 1;
+    KIND_STDERR = 2;
+    KIND_FILE = 3;
+    KIND_STILL_OVERLAY = 4;           // <=200KB WebP q=95 (§6.3)
+  }
+  Kind kind = 2;
+  bytes data = 3;
+  bool eof = 4;
+}
+
+message Shutdown {
+  string reason = 1;
+}

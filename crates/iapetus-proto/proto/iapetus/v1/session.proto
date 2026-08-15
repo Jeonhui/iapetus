@@ -1,0 +1,55 @@
+syntax = "proto3";
+
+package iapetus.v1;
+
+import "google/protobuf/timestamp.proto";
+import "iapetus/v1/common.proto";
+
+// PRD §5.6 sessions and the control lease.
+// Many sessions may exist at once, but WRITE is always held by exactly one.
+// ControlLevel lives in common.proto because Desktop carries it too.
+
+message Session {
+  string id = 1;                                    // ses_
+  string desktop_id = 2;
+  Actor actor = 3;
+  ControlLevel control = 4;
+  int32 heartbeat_interval_sec = 5;                 // S — server-assigned (default 30)
+  google.protobuf.Timestamp lease_expires_at = 6;   // S — heartbeat_interval_sec * 3
+  google.protobuf.Timestamp started_at = 7;
+}
+
+message CreateSessionRequest {
+  string desktop_id = 1;
+  // The maximum level this session may request — it does NOT auto-acquire
+  // the lease (§8.1). Viewers always start at READ and must call acquire,
+  // so merely opening a viewer never preempts a running agent.
+  ControlLevel control = 2;
+}
+
+message AcquireControlRequest {
+  string session_id = 1;
+  // Reason for taking over; delivered to the agent on control.revoked (§7.5).
+  optional string note = 2;                         // <=200 chars
+}
+
+message HeartbeatResponse {
+  google.protobuf.Timestamp lease_expires_at = 1;
+}
+
+// ── Owner management (PRD §8.1) ───────────────────────────
+// Initial owners at creation:            project:manage
+// Adding while zero human owners exist:  project:manage (bootstrap)
+// Once any human owner exists:           desktop:owners:manage (humans only)
+// The protected act is removal, not first assignment.
+message AddOwnerRequest {
+  string desktop_id = 1;
+  Actor actor = 2;
+}
+
+message ConvertToSharedRequest {
+  string desktop_id = 1;
+  // Acknowledges that existing logged-in sessions become visible to the new
+  // owners. Irreversible (§5.2).
+  bool confirm_exposure = 2;
+}

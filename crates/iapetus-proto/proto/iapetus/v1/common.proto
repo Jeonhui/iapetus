@@ -1,0 +1,99 @@
+syntax = "proto3";
+
+package iapetus.v1;
+
+// Encodes PRD §8.2 (API conventions).
+// This file is the single source for identifiers, time, and coordinates;
+// every other .proto refers here rather than restating.
+
+// ── Identifiers ───────────────────────────────────────────
+// PRD §8.2: {prefix}{26-char Crockford Base32 ULID}. Opaque, case-sensitive.
+// Kept as `string` here because protobuf has no string pattern constraint —
+// prefix and format validation belongs to the newtypes in iapetus-proto.
+//
+// Prefix registry (PRD §8.2):
+//   dsk_ Desktop | ses_ Session | own_ Owner   | prj_ Project | job_ Job
+//   sec_ Secret  | whk_ Webhook | img_ Image   | evt_ Event   | dlv_ Delivery
+//   shot_ Screenshot | req_ Request | jti_ TokenId
+
+// ── Time ──────────────────────────────────────────────────
+// PRD §8.2: RFC 3339 UTC with exactly 3 fractional digits.
+// google.protobuf.Timestamp can express nanoseconds; serialization truncates
+// to milliseconds. Its canonical JSON mapping is RFC 3339, so the wire format
+// matches the convention without extra work.
+
+// ── Coordinates ───────────────────────────────────────────
+// PRD §8.2: integer pixels. Out-of-screen coordinates are rejected, never
+// clamped — silently correcting them hides the caller's own bug.
+message Point {
+  int32 x = 1;
+  int32 y = 2;
+}
+
+// PRD §8.2: an object, not a positional array. `[100,100,420,720]` gives the
+// reader no way to tell x/y/w/h from x1/y1/x2/y2.
+message Bounds {
+  int32 x = 1;
+  int32 y = 2;
+  int32 width = 3;
+  int32 height = 4;
+}
+
+message Display {
+  int32 width = 1;
+  int32 height = 2;
+  int32 dpi = 3;
+}
+
+// ── Errors ────────────────────────────────────────────────
+// PRD §8.2 error envelope. `code` is the stable identifier from §8.9;
+// clients must handle unknown codes by HTTP status, since codes are additive.
+message Error {
+  string code = 1;
+  string message = 2;
+  // req_ prefix. Also returned on 2xx via the X-Request-Id header, so a
+  // customer can point at a specific trace (§12.6).
+  string request_id = 3;
+  map<string, string> details = 4;
+  optional int32 retry_after_sec = 5;
+}
+
+// ── Pagination ────────────────────────────────────────────
+// PRD §8.2: cursor-based. Offsets are not used because entries duplicate or
+// disappear when the underlying list changes between pages.
+message PageRequest {
+  int32 limit = 1;                        // default 25, max 100
+  optional string starting_after = 2;     // server-issued id only
+}
+
+message PageInfo {
+  bool has_more = 1;
+  optional string next_cursor = 2;
+}
+
+// ── Actors ────────────────────────────────────────────────
+// PRD §5.2 co-ownership: humans and agents hold identical authority.
+enum ActorType {
+  ACTOR_TYPE_UNSPECIFIED = 0;
+  ACTOR_TYPE_HUMAN = 1;
+  ACTOR_TYPE_AGENT = 2;
+}
+
+message Actor {
+  ActorType type = 1;
+  // PRD §8.2 exemption: actor ids do NOT follow the ULID rule. The value is
+  // asserted by the customer, so it is free-form UTF-8 (<=128 chars) and is
+  // never parsed by Iapetus — only recorded in the audit log.
+  string id = 2;
+  optional string display_name = 3;
+}
+
+// ── Control lease ─────────────────────────────────────────
+// PRD §5.6. Lives in common because both Desktop and Session carry it:
+// Desktop.sessions[] needs the level, so defining it in session.proto would
+// create a desktop → session dependency that collides with the reverse.
+enum ControlLevel {
+  CONTROL_LEVEL_UNSPECIFIED = 0;
+  CONTROL_LEVEL_READ = 1;    // observe only — screenshot, app.list, events
+  CONTROL_LEVEL_WRITE = 2;   // holds the input lease
+}

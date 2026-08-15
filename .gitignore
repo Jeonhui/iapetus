@@ -1,0 +1,73 @@
+# ── Rust ──────────────────────────────────────────────────
+/target/
+**/target/
+*.pdb
+
+# Cargo.lock IS committed. This workspace produces binaries (iapetusd,
+# iapetus-control, iapetus-cli), and reproducible builds of the daemon that
+# ships inside customer images matter more than dependency freshness.
+
+# ── Generated from .proto ─────────────────────────────────
+# The .proto files under crates/iapetus-proto/proto are the source of truth
+# (PRD §19.1). Anything generated from them is rebuilt, never committed.
+*.descriptor
+*.descriptor_set
+/gen/
+**/generated/
+
+# ── SDKs ──────────────────────────────────────────────────
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# TypeScript / Node
+node_modules/
+dist/
+build/
+*.tsbuildinfo
+.npm/
+.yarn/
+
+# ── Secrets and local configuration ───────────────────────
+# PRD §8.1: Project Keys (sk_iap_live_...) must never reach a repository.
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+!**/testdata/**/*.key
+*.p12
+credentials.json
+secrets.yaml
+
+# ── Local runtime artifacts ───────────────────────────────
+# docker compose up (PRD §14.4) writes volumes and logs here
+/.local/
+/volumes/
+/snapshots/
+*.qcow2
+*.squashfs
+*.rootfs
+*.log
+
+# Screenshots and recordings produced while testing the viewer
+/captures/
+/recordings/
+
+# ── Tooling state ─────────────────────────────────────────
+# oh-my-claudecode session state: per-session and not meaningful to others
+.omc/
+
+# ── Editors and OS ────────────────────────────────────────
+.DS_Store
+.idea/
+.vscode/
+!.vscode/extensions.json
+*.swp
+*~

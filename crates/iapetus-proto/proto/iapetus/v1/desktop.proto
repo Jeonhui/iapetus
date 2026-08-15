@@ -1,0 +1,143 @@
+syntax = "proto3";
+
+package iapetus.v1;
+
+import "google/protobuf/timestamp.proto";
+import "iapetus/v1/common.proto";
+
+// PRD §8.3 resource schemas.
+// S  = server-set (ignored if sent by the client)
+// C  = client-set
+// C! = client-set at creation only
+
+// PRD §5.4 state machine
+enum DesktopStatus {
+  DESKTOP_STATUS_UNSPECIFIED = 0;
+  DESKTOP_STATUS_PROVISIONING = 1;
+  DESKTOP_STATUS_ACTIVE = 2;
+  DESKTOP_STATUS_DEGRADED = 3;   // sub-state of ACTIVE: running but limited (§19.4)
+  DESKTOP_STATUS_SUSPENDED = 4;
+  DESKTOP_STATUS_DELETING = 5;   // 24h recovery window (§10.3)
+  DESKTOP_STATUS_ERROR = 6;
+  DESKTOP_STATUS_TERMINATED = 7;
+}
+
+enum Os {
+  OS_UNSPECIFIED = 0;
+  OS_LINUX = 1;
+  OS_WINDOWS = 2;
+}
+
+// PRD §8.3: fixed tiers, not free-form numbers. Arbitrary combinations would
+// break the §12.4 capacity model, which derives density per tier.
+enum SpecTier {
+  SPEC_TIER_UNSPECIFIED = 0;
+  SPEC_TIER_LIGHT = 1;      // 2 vCPU / 2GB / 20GB — 34 per host (CPU-bound)
+  SPEC_TIER_STANDARD = 2;   // 2 vCPU / 4GB / 40GB — 28 per host (memory-bound)
+  SPEC_TIER_LARGE = 3;      // 4 vCPU / 8GB / 80GB — 14 per host
+  SPEC_TIER_GPU = 4;        // 4 vCPU / 8GB + GPU  — 14 per host
+}
+
+// PRD §5.2: personal allows one human owner, shared allows many.
+// Conversion is irreversible and goes through a dedicated endpoint.
+enum DesktopType {
+  DESKTOP_TYPE_UNSPECIFIED = 0;
+  DESKTOP_TYPE_PERSONAL = 1;
+  DESKTOP_TYPE_SHARED = 2;
+}
+
+// PRD §7.3: owner is the default; restricted is opt-in for regulated tenants.
+enum PrivilegeMode {
+  PRIVILEGE_MODE_UNSPECIFIED = 0;
+  PRIVILEGE_MODE_OWNER = 1;
+  PRIVILEGE_MODE_RESTRICTED = 2;
+}
+
+message OsUser {
+  string name = 1;      // S — fixed by the image, not changeable
+  bool sudo = 2;        // S — NOPASSWD under OWNER mode
+}
+
+message Owner {
+  string owner_id = 1;              // S — own_
+  Actor actor = 2;                  // C!
+  google.protobuf.Timestamp added_at = 3;  // S
+}
+
+message Desktop {
+  string id = 1;                                    // S — dsk_
+  string name = 2;                                  // C — unique per project, ^[a-z0-9][a-z0-9-]{0,62}$
+  string project_id = 3;                            // S — prj_
+  Os os = 4;                                        // C!
+  string image = 5;                                 // C! — img_ id or a catalog tag
+  SpecTier spec_tier = 6;                           // C
+  Display display = 7;                              // C
+  DesktopType desktop_type = 8;                     // C!
+  PrivilegeMode privilege_mode = 9;                 // C
+  OsUser os_user = 10;                              // S
+  repeated Owner owners = 11;                       // C! creation only (§8.1)
+  DesktopStatus status = 12;                        // S
+  bool persistent = 13;                             // S — always true in v1
+  int32 idle_timeout_sec = 14;                      // C — 60 ~ 86400
+  bool auto_suspend = 15;                           // C
+  map<string, string> labels = 16;                  // C — key/value <=63 chars, max 20 pairs
+  repeated SessionSummary sessions = 17;            // S — basis for idle detection (§5.4)
+  google.protobuf.Timestamp created_at = 18;        // S
+  google.protobuf.Timestamp last_active_at = 19;    // S
+}
+
+// Compact form embedded in Desktop. Full Session lives in session.proto.
+message SessionSummary {
+  string session_id = 1;
+  Actor actor = 2;
+  ControlLevel control = 3;
+}
+
+// ── Requests ──────────────────────────────────────────────
+message CreateDesktopRequest {
+  string name = 1;
+  Os os = 2;
+  optional string image = 3;
+  optional SpecTier spec_tier = 4;
+  optional Display display = 5;
+  optional DesktopType desktop_type = 6;
+  repeated Actor owners = 7;              // requires project:manage (§8.1)
+  optional string clone_volume_from = 8;  // clone an existing volume (§12.3)
+  map<string, string> labels = 9;
+}
+
+message ListDesktopsRequest {
+  PageRequest page = 1;
+  optional DesktopStatus status = 2;
+  optional string label = 3;              // "key:value"
+  optional Os os = 4;
+  optional DesktopType desktop_type = 5;
+}
+
+message ListDesktopsResponse {
+  repeated Desktop data = 1;
+  PageInfo page = 2;
+}
+
+message DeleteDesktopRequest {
+  string desktop_id = 1;
+  string confirm_name = 2;                // compared byte-exact (§8.3)
+}
+
+// ── Async jobs (PRD §8.4) ─────────────────────────────────
+enum JobStatus {
+  JOB_STATUS_UNSPECIFIED = 0;
+  JOB_STATUS_RUNNING = 1;
+  JOB_STATUS_SUCCEEDED = 2;
+  JOB_STATUS_FAILED = 3;
+}
+
+message Job {
+  string id = 1;                              // job_
+  string type = 2;                            // e.g. "desktop.create"
+  JobStatus status = 3;
+  optional string resource_id = 4;
+  google.protobuf.Timestamp started_at = 5;
+  optional google.protobuf.Timestamp finished_at = 6;
+  optional Error error = 7;
+}

@@ -1,0 +1,84 @@
+syntax = "proto3";
+
+package iapetus.v1;
+
+import "google/protobuf/timestamp.proto";
+import "iapetus/v1/common.proto";
+import "iapetus/v1/desktop.proto";
+import "iapetus/v1/action.proto";
+
+// PRD §8.7 events.
+// SSE and webhooks share this envelope so a receiver never needs two parsers.
+// Delivery is at-least-once and unordered: dedupe on `id`, sort on `created_at`.
+
+message Event {
+  string id = 1;                                  // evt_
+  google.protobuf.Timestamp created_at = 2;
+  string project_id = 3;
+  string desktop_id = 4;
+  oneof data {
+    ControlGranted control_granted = 5;
+    ControlRevoked control_revoked = 6;
+    ControlRequested control_requested = 7;
+    DesktopStatusChanged desktop_status = 8;
+    DesktopError desktop_error = 9;
+    JobFinished job_finished = 10;
+    QuotaExceeded quota_exceeded = 11;
+    WindowChanged window_opened = 12;
+    WindowChanged window_closed = 13;
+    AppExited app_exited = 14;
+    ViewerChanged viewer_joined = 15;
+    ViewerChanged viewer_left = 16;
+    WebhookFailed webhook_failed = 17;            // SSE/dashboard only — delivering
+                                                  // it by webhook would be circular
+  }
+}
+
+message ControlGranted { string session_id = 1; Actor actor = 2; }
+
+message ControlRevoked {
+  string session_id = 1;
+  Actor by_actor = 2;
+  enum Reason {
+    REASON_UNSPECIFIED = 0;
+    REASON_PREEMPTED = 1;       // a human took over
+    REASON_LEASE_EXPIRED = 2;
+    REASON_SESSION_CLOSED = 3;
+  }
+  Reason reason = 3;
+  optional string note = 4;     // reason the human gave when taking over (§7.5)
+}
+
+message ControlRequested { Actor by_actor = 1; }
+
+message DesktopStatusChanged {
+  DesktopStatus from = 1;
+  DesktopStatus to = 2;
+  optional string reason = 3;
+}
+
+message DesktopError {
+  string reason = 1;
+  bool recoverable = 2;
+  bool data_recoverable = 3;    // whether the volume can still be retrieved (§12.3)
+}
+
+message JobFinished {
+  string job_id = 1;
+  string type = 2;
+  JobStatus status = 3;
+  optional Error error = 4;
+}
+
+message QuotaExceeded { string quota = 1; int64 limit = 2; int64 current = 3; }
+message WindowChanged { Window window = 1; }
+
+message AppExited {
+  optional string key = 1;
+  int32 pid = 2;
+  int32 exit_code = 3;
+  bool crashed = 4;
+}
+
+message ViewerChanged { Actor actor = 1; ControlLevel control = 2; }
+message WebhookFailed { string webhook_id = 1; int32 attempts = 2; }

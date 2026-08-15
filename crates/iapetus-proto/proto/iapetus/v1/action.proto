@@ -1,0 +1,210 @@
+syntax = "proto3";
+
+package iapetus.v1;
+
+import "google/protobuf/timestamp.proto";
+import "iapetus/v1/common.proto";
+import "iapetus/v1/desktop.proto";  // ActResponse.desktop_status
+
+// PRD §7.2 Computer API.
+// Shared by the Control Plane and iapetusd; defining actions once here is what
+// keeps the two from drifting (§19.1).
+
+enum MouseButton {
+  MOUSE_BUTTON_UNSPECIFIED = 0;
+  MOUSE_BUTTON_LEFT = 1;
+  MOUSE_BUTTON_RIGHT = 2;
+  MOUSE_BUTTON_MIDDLE = 3;
+}
+
+enum ImageFormat {
+  IMAGE_FORMAT_UNSPECIFIED = 0;
+  IMAGE_FORMAT_JPEG = 1;
+  IMAGE_FORMAT_PNG = 2;
+  IMAGE_FORMAT_WEBP = 3;
+}
+
+// ── Observation ───────────────────────────────────────────
+message ScreenshotRequest {
+  ImageFormat format = 1;
+  int32 quality = 2;                  // 1-100 (§8.2)
+  optional Bounds region = 3;
+  optional double scale = 4;          // 0 < scale <= 1; upscaling is rejected
+}
+
+message ScreenshotResponse {
+  oneof payload {
+    string url = 1;                   // default; presigned
+    bytes inline = 2;                 // only under 256KB (§8.2)
+  }
+  int32 width = 3;                    // size of the transmitted image
+  int32 height = 4;
+  Display display = 5;                // frame of reference for coordinates (§7.2)
+  // PRD §6.3 freshness contract: proves the frame was captured after the
+  // preceding action completed, so an agent never acts on a pre-click screen.
+  google.protobuf.Timestamp taken_at = 6;
+}
+
+message Window {
+  string id = 1;                      // win_ — guest-local, reused across reboots
+  string title = 2;
+  Bounds bounds = 3;
+  bool focused = 4;
+}
+
+message WindowList {
+  repeated Window windows = 1;
+  bool truncated = 2;                 // capped at 1000 entries (§8.2)
+}
+
+message ScreenInfo {
+  Display display = 1;
+  int32 monitor_count = 2;            // always 1 in v1 (§7.2)
+}
+
+// ── Input ─────────────────────────────────────────────────
+message MouseMove   { Point to = 1; optional int32 duration_ms = 2; }
+message MouseClick  { optional Point at = 1; MouseButton button = 2; int32 count = 3; }
+message MouseUpDown { MouseButton button = 1; }
+message MouseDrag   { Point from = 1; Point to = 2; optional int32 duration_ms = 3; }
+message Scroll      { optional Point at = 1; int32 dx = 2; int32 dy = 3; }
+message TypeText    { string text = 1; optional int32 delay_ms = 2; }  // <=8192 chars, NFC-normalized
+message KeyPress    { string keys = 1; optional int32 count = 2; }     // "ctrl+c", "Enter"
+message KeyUpDown   { string key = 1; }
+
+// PRD §9.3: keeps the plaintext out of the agent's context, the audit log, and
+// captures. It does NOT protect against the agent itself — under OWNER mode the
+// agent is root and can recover the value by other means (§9.3).
+message SecretType  { string secret_ref = 1; }
+
+// ── Apps and windows ──────────────────────────────────────
+message AppLaunch {
+  oneof target {
+    string key = 1;                   // catalog key
+    string command = 2;               // arbitrary executable path (OWNER mode)
+  }
+  repeated string args = 3;
+  optional string cwd = 4;
+  optional bool elevated = 5;
+  optional bool wait_for_window = 6;
+}
+
+message AppInstall {
+  string manager = 1;                 // apt | winget | msi | brew
+  oneof source { string package = 2; string url = 3; }
+}
+
+message AppInfo {
+  string key = 1;
+  string name = 2;
+  bool installed = 3;
+  bool running = 4;
+  optional int32 pid = 5;
+  repeated Window windows = 6;
+}
+
+message AppList {
+  repeated AppInfo apps = 1;
+  bool truncated = 2;
+}
+
+message ProcessInfo { int32 pid = 1; string name = 2; }
+message ProcessList { repeated ProcessInfo processes = 1; bool truncated = 2; }
+
+// ── Filesystem ────────────────────────────────────────────
+message FsEntry {
+  string path = 1;
+  bool is_dir = 2;
+  int64 size_bytes = 3;
+  google.protobuf.Timestamp modified_at = 4;
+}
+
+message FsList {
+  repeated FsEntry entries = 1;
+  bool truncated = 2;                 // capped at 1000 — the guest has no stable
+                                      // snapshot to paginate over (§8.2)
+}
+
+// ── Shell and system ──────────────────────────────────────
+message ShellExec {
+  string command = 1;
+  optional string cwd = 2;
+  map<string, string> env = 3;
+  optional bool elevated = 4;
+  int32 timeout_ms = 5;               // default 30000, max 300000
+}
+
+message ShellResult {
+  int32 exit_code = 1;
+  string stdout = 2;                  // truncated at 1MB
+  string stderr = 3;                  // truncated at 1MB
+  bool truncated = 4;
+}
+
+// ── Waiting ───────────────────────────────────────────────
+enum WaitMode {
+  WAIT_MODE_UNSPECIFIED = 0;
+  WAIT_MODE_SCREEN_STABLE = 1;        // two consecutive frames below a delta threshold
+  WAIT_MODE_WINDOW_APPEARS = 2;
+  WAIT_MODE_DURATION = 3;
+}
+
+message WaitFor {
+  WaitMode mode = 1;
+  int32 timeout_ms = 2;               // default 10000, max 120000
+  optional string window_title_regex = 3;
+}
+
+// ── Action envelope ───────────────────────────────────────
+message Action {
+  oneof kind {
+    ScreenshotRequest screenshot = 1;
+    MouseMove mouse_move = 2;
+    MouseClick mouse_click = 3;
+    MouseUpDown mouse_down = 4;
+    MouseUpDown mouse_up = 5;
+    MouseDrag mouse_drag = 6;
+    Scroll scroll = 7;
+    TypeText type_text = 8;
+    KeyPress key = 9;
+    KeyUpDown key_down = 10;
+    KeyUpDown key_up = 11;
+    SecretType secret_type = 12;
+    AppLaunch app_launch = 13;
+    AppInstall app_install = 14;
+    ShellExec shell_exec = 15;
+    WaitFor wait_for = 16;
+  }
+}
+
+message ActionResult {
+  bool ok = 1;
+  int32 elapsed_ms = 2;
+  optional Error error = 3;
+  oneof value {
+    ScreenshotResponse screenshot = 4;
+    WindowList windows = 5;
+    AppList apps = 6;
+    ProcessList processes = 7;
+    FsList files = 8;
+    ShellResult shell = 9;
+    ScreenInfo screen = 10;
+  }
+}
+
+// PRD §7.2: act is NOT atomic — GUI work cannot be rolled back. It fails fast,
+// returns the partial results, and always includes a screenshot of the moment of
+// failure, which is the agent's only way to learn how far the screen got.
+message ActRequest {
+  repeated Action actions = 1;        // max 64 (§8.2)
+  bool return_screenshot = 2;
+  int32 timeout_ms = 3;               // whole-batch, not per-action. default 30000, max 120000
+}
+
+message ActResponse {
+  string session_id = 1;
+  repeated ActionResult results = 2;
+  optional int32 failed_at = 3;       // index of the failing action
+  optional ScreenshotResponse screenshot = 4;
+  DesktopStatus desktop_status = 5;
+}
