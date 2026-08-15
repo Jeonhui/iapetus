@@ -10,9 +10,12 @@ repository.workspace = true
 [dependencies]
 iapetus-proto = { path = "../iapetus-proto" }
 thiserror.workspace = true
+# Pure Rust: speaks the X protocol over a socket, so the container needs no
+# libx11-dev and cross-compilation stays simple.
+x11rb = { workspace = true, optional = true, features = ["xtest", "damage"] }
 
 [features]
 default = []
 # The real X11 backend. Off by default so the crate builds and tests on any
 # host; CI enables it inside the Linux container (§15.1 L2).
-x11 = []
+x11 = ["dep:x11rb"]

@@ -1,0 +1,26 @@
+# Builds and runs the L2 integration tests against a real X server (§15.1).
+#
+# Separate from the runtime image on purpose: the runtime image ships a stripped
+# binary and no toolchain, while this one needs cargo and the test harness. The
+# base packages are kept identical so what is verified here matches what ships.
+FROM rust:1-bookworm
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      xvfb x11-utils x11-apps openbox dbus-x11 \
+      fonts-noto-cjk ibus ibus-hangul \
+      sudo ca-certificates \
+ && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /src
+COPY Cargo.toml Cargo.lock ./
+COPY crates/ ./crates/
+
+# Compile the tests during the build so a compile error fails the image build
+# rather than showing up as a confusing runtime failure.
+RUN cargo test -p iapetusd --features x11 --no-run
+
+COPY images/linux-base/run-l2.sh /usr/local/bin/run-l2.sh
+RUN chmod +x /usr/local/bin/run-l2.sh
+
+ENV DISPLAY=:1 SCREEN_GEOMETRY=1920x1080x24
+ENTRYPOINT ["/usr/local/bin/run-l2.sh"]

@@ -11,7 +11,11 @@ use std::time::{Duration, SystemTime};
 
 pub mod fake;
 
-#[cfg(all(target_os = "linux", feature = "x11"))]
+// Gated on the feature rather than the OS: x11rb is pure Rust and compiles
+// anywhere, so `cargo check --features x11` gives fast feedback off Linux.
+// Actually connecting requires an X server, which is why the behavioural
+// checks live in the container (§15.1 L2).
+#[cfg(feature = "x11")]
 pub mod x11;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
