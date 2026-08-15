@@ -1,0 +1,23 @@
+[package]
+name = "iapetus-proto"
+description = "Shared action, event, and transport types for the Control Plane and iapetusd"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+prost.workspace = true
+prost-types.workspace = true
+thiserror.workspace = true
+tonic = { workspace = true, optional = true }
+
+[build-dependencies]
+tonic-build.workspace = true
+
+[features]
+# The daemon channel (PRD §19.5) is gRPC. Consumers that only need the message
+# types — the SDKs' schema generation, for instance — skip the service stubs.
+default = ["grpc"]
+grpc = ["dep:tonic"]

@@ -1,0 +1,26 @@
+[workspace]
+resolver = "2"
+members = ["crates/iapetus-proto"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.75"
+license = "UNLICENSED"
+repository = "https://github.com/Jeonhui/iapetus"
+
+[workspace.dependencies]
+prost = "0.13"
+prost-types = "0.13"
+tonic = "0.12"
+tonic-build = "0.12"
+prost-build = "0.13"
+thiserror = "2"
+
+[profile.release]
+# iapetusd ships inside customer images (PRD §19.1), so binary size and a
+# predictable failure mode matter more than the last few percent of speed.
+lto = "thin"
+codegen-units = 1
+panic = "abort"
+strip = true

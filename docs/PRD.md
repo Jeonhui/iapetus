@@ -1399,12 +1399,12 @@ Fixed once here rather than repeated per endpoint. Everything below applies acro
 | Owner entry | `own_` | Image | `img_` |
 | Project | `prj_` | Event | `evt_` |
 | Async job | `job_` | Webhook delivery | `dlv_` |
-| Screenshot | `shot_` | Request trace | `req_` |
+| Screenshot | `sht_` | Request trace | `req_` |
 | Token id | `jti_` | | |
 
 - Format: `{prefix}{26-character Crockford Base32 ULID}` — e.g. `dsk_01H8XK4M2N7P9Q3R5S6T7V8W9X`.
 - **Opaque.** Assume no structure beyond the prefix. Do not infer ordering or creation time from an id.
-- **Case-sensitive.** Thirty characters total, `[A-Za-z0-9_]` only. All server-generated.
+- **Case-sensitive.** Exactly 30 characters, `[A-Za-z0-9_]` only, all server-generated. Every prefix is three characters, which is what makes the total fixed — that buys fixed-width database columns, aligned logs, and a parser that slices at a constant offset. A four-character prefix would silently make some ids 31, so the registry is asserted in `iapetus-proto`.
 - **Exception — actor ids do not follow this rule.** `actor.id` (§8.1) is a value the customer asserts, so it is free-form UTF-8 up to 128 characters and **Iapetus never parses it.** It is recorded verbatim in the audit log.
 - Window ids (`win_1`) are **guest-local identifiers** reused after a reboot. Never store them as persistent references.
 

@@ -14,7 +14,7 @@ package iapetus.v1;
 // Prefix registry (PRD §8.2):
 //   dsk_ Desktop | ses_ Session | own_ Owner   | prj_ Project | job_ Job
 //   sec_ Secret  | whk_ Webhook | img_ Image   | evt_ Event   | dlv_ Delivery
-//   shot_ Screenshot | req_ Request | jti_ TokenId
+//   sht_ Screenshot | req_ Request | jti_ TokenId
 
 // ── Time ──────────────────────────────────────────────────
 // PRD §8.2: RFC 3339 UTC with exactly 3 fractional digits.

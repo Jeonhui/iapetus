@@ -17,7 +17,11 @@ import "iapetus/v1/event.proto";
 service DaemonChannel {
   // One long-lived bidirectional stream per Desktop, multiplexing actions,
   // responses, events, and heartbeats.
-  rpc Connect(stream GuestFrame) returns (stream ControlFrame);
+  //
+  // Named Attach rather than Connect: tonic generates a `connect()` constructor
+  // on every client, so an RPC of that name collides with it and the crate does
+  // not compile. "Attach" also matches how §5.6 describes joining a Desktop.
+  rpc Attach(stream GuestFrame) returns (stream ControlFrame);
 }
 
 // ── Guest -> Control Plane ────────────────────────────────
