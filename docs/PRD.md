@@ -5,7 +5,7 @@
 
 | Field | Value |
 |---|---|
-| Version | **v0.9.2** |
+| Version | **v0.9.3** |
 | Last updated | 2026-08-15 |
 | Status | Draft — before technical validation |
 | Document owner | Product (Jeonhui Lee) |
@@ -30,6 +30,7 @@
 | **v0.9** | 2026-08-15 | **Density and authority re-examined; auth completed.** §6.4 gained the **rejection of multi-session** (isolation ladder, break-even at 28% activity ratio) and the **deferral of Desktop Group** (2.3× better for same-trust-domain parallelism, designed so the API model is unchanged, v2). §8.1 gained a token signing scheme — Ed25519, JWKS, 90-day rotation, the `jti` claim that revocation had been operating on without ever defining, and `orig_iat` for total-lifetime enforcement. §12.5 added **six lightweighting levers**. §12.4 corrected `light` from 40 to **34** (the 2.5:1 ceiling includes the encoding reservation) and three stale `28`s removed. Precedence rule gained a **single-source-per-topic** layer. Control lease arbitration gained a row for agent-versus-agent contention |
 | v0.9.1 | 2026-08-15 | Document translated to English. No design changes; terminology fixed against a locked glossary and verified mechanically. The Korean original is retained at `docs/PRD.ko.md` |
 | **v0.9.2** | 2026-08-15 | **Embedding contract added (parent-product integration audit).** V-09 had committed the viewer to iframe embedding without a single rule making it safe or workable: no frame policy, no origin allowlist, and no way for the host page to learn viewer-local state. §7.5 gained **Embedding in a parent product** — framing denied by default, per-project `embed_origins` (exact match, no wildcard subdomains), a second in-page origin check because CSP fails open where it is not enforced, and a versioned `postMessage` contract. The `token_expiring` message closes a real hole: an embedded viewer would otherwise go black at the §8.1 eight-hour refresh cap with no signal to the host. §9.2 gained the matching policy row and §8.3 the matching schema field, project-level only. A blank line that had split the revision table in two was removed |
+| **v0.9.3** | 2026-08-15 | **Fallback media framing specified.** §6.3 and §19.7 both named the WebSocket JPEG-diff path without ever fixing its wire format, which left V-09's promise that a customer can build their own viewer resting on a format described only in our client. §19.6 gains the tile framing (64px, edge-clipped, changed tiles only, non-overlapping) and the JSON input vocabulary, with the rules that are not obvious from the bytes: motion coalesced per §7.5, Hangul sent on `compositionend` as a finished string per §15.2, an unrecognised message dropped rather than guessed at, and the lease check placed in the gateway because a Control Plane round trip would exceed §6.3's 20–50ms input budget. Both sockets stated as authenticated — an unauthenticated viewer socket hands a stranger the screen and the keyboard |
 
 ### How to read this
 
@@ -3275,6 +3276,57 @@ The heartbeat's `load` is an observability hint, not a basis for billing or sche
 | Still overlay | Sent **over the control stream rather than the media path** (§19.5 `StreamChunk`), then relayed by the gateway to the viewer's DataChannel | WebP cannot ride the video track, and the gateway does not decode, so it only passes it through |
 
 The gateway **never decodes anything.** Layer dropping is header-based, the overlay is passed through, and masking has already been applied in the guest — none of the three requires the transcoding §6.3 rejected.
+
+#### The fallback path — WebSocket JPEG diff
+
+§6.3 names this the path for networks that block UDP entirely, and §19.7 lists it beside WebRTC. Its framing is fixed here **because a customer may build their own viewer** (§7.5, V-09): a format described only in our client is not something a third party can implement against.
+
+```text
+guest ──① dials out, ws(s)://gateway/ingest ─────► stream gateway
+                                                        │
+browser ◄─② ws(s)://gateway/view?token=<Viewer Token> ──┘
+```
+
+The guest dials out here exactly as it does for §19.5, so §9.1's no-inbound-port rule holds on this path too.
+
+**Screen updates (gateway → viewer), binary.** The gateway relays the guest's bytes unchanged.
+
+| Offset | Size | Field |
+|---|---|---|
+| 0 | 4 | `seq`, big-endian. Advances on every tick, including empty ones, so a viewer can tell a dropped update from a still screen |
+| 4 | 2 | screen width |
+| 6 | 2 | screen height |
+| 8 | 1 | `1` when every tile is present |
+| 9 | 1 | reserved, zero |
+| 10 | 2 | tile count |
+| 12 | … | tile records |
+
+Each tile record is `x, y, w, h` as `u16` then a `u32` length and that many JPEG bytes.
+
+- **Tiles are 64×64, clipped at the edges.** 1080 is not a multiple of 64, and padding the last row would encode rows that do not exist and paint them onto the viewer.
+- **Only changed tiles are sent.** A still Desktop costs one hash pass and zero bytes, which is what keeps an idle Desktop inside the §12.4 encoding reservation.
+- **Tiles never overlap**, so a viewer may draw them in any order.
+- Frame rate is capped at **10fps** (§6.3's 5–10fps band).
+
+**A viewer joining mid-stream needs a keyframe**, since diffs against a frame it never saw paint nothing. The gateway caches the newest tile per position and rebuilds one **in this same format**, so a viewer needs no second parser. Where its cache is empty it asks the guest instead. Caching bytes by position is not decoding.
+
+**Input (viewer → gateway → guest), JSON.** One object per message, discriminated by `type`. The guest turns these into the **same Computer API actions an agent sends** (§7.5) — there is no second input path.
+
+| `type` | Fields | Notes |
+|---|---|---|
+| `mouse.move` | `x`, `y` | Integer guest pixels (§8.2). The viewer converts from its own scaled canvas |
+| `mouse.down` / `mouse.up` | `button` ∈ `left`\|`middle`\|`right` | Carries no coordinate, so a viewer must send `mouse.move` first |
+| `scroll` | `x`, `y`, `dx`, `dy` | |
+| `type` | `text` | **Text goes here, never as synthesized keys.** §15.2: Hangul sent key by key arrives as jamo |
+| `key` | `keys`, e.g. `"ctrl+c"`, `"Enter"` | Shortcuts and named keys |
+| `keyframe` | — | Request a full frame. Permitted at `READ`, since an observer still needs a picture |
+
+- **The viewer coalesces mouse motion**, per §7.5: 60–120 events/second would exceed §8.2's request cap. One per animation frame, newest position only.
+- **Hangul is sent on `compositionend`** as the finished string. Forwarding keystrokes during composition composes them twice, once in the browser and once in the guest IME.
+- **The gateway drops input from a `READ` socket.** §7.5 puts the lease check here rather than in the Control Plane, because a round trip through it would exceed the 20–50ms input budget.
+- An unrecognised `type` is **dropped, not guessed at.** Guessing turns a viewer bug into input the person never asked for, on a Desktop they own.
+
+**Both sockets are authenticated.** `/ingest` by the guest's registration credential (§19.6 above), `/view` by a §8.1 Viewer Token whose control level decides `READ` or `WRITE`. An unauthenticated viewer socket would hand a stranger the screen *and* the keyboard.
 
 ### 19.7 Everything else
 

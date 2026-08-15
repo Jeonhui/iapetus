@@ -163,6 +163,18 @@ impl Dispatcher {
         self.frames.screen_info().ok()
     }
 
+    /// A frame for the stream encoder.
+    ///
+    /// Deliberately not freshness-gated. §6.3's freshness contract anchors a
+    /// *screenshot* to the action before it, because an agent reasoning from a
+    /// pre-click screen is a correctness fault. A stream has no such anchor —
+    /// it is continuous — and forcing a capture per tick would defeat §6.3's
+    /// single shared Frame Source, which exists so the still and video paths do
+    /// not each pull their own frames.
+    pub fn capture_for_stream(&self) -> crate::platform::Result<crate::platform::Frame> {
+        self.frames.capture_now(None)
+    }
+
     /// Executes one action, reporting failure as a result rather than an error.
     ///
     /// The channel needs this shape: a failed action is an answer the agent can

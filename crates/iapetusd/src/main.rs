@@ -39,6 +39,7 @@ fn main() -> ExitCode {
         Some("--supervise-x11") => supervise(),
         Some("--connect") => connect(),
         Some("--screenshot") => screenshot(args.get(1).map(String::as_str)),
+        Some("--stream") => stream(args.get(1).map(String::as_str)),
         Some(other) => {
             eprintln!("unknown argument: {other}");
             usage();
@@ -53,10 +54,11 @@ fn main() -> ExitCode {
 
 fn usage() {
     eprintln!(
-        "usage: iapetusd [--connect | --screenshot FILE | --supervise-x11 | --selftest | --version]\n\
+        "usage: iapetusd [--connect | --stream URL | --screenshot FILE | --supervise-x11 | --selftest | --version]\n\
          \n\
          --connect        dial the Control Plane and serve actions (§19.5)\n\
          --screenshot F   capture the screen through the real pipeline into F (png)\n\
+         --stream URL     push the screen to a stream gateway and take its input\n\
          --supervise-x11  hold the display session open (the container entry point)\n\
          --selftest       exercise the platform layer and report\n\
          --version        print version and supported protocol range"
@@ -160,6 +162,52 @@ fn screenshot(path: Option<&str>) -> ExitCode {
     }
     println!("wrote {} ({}x{}, {} bytes)", path, shot.width, shot.height, bytes.len());
     ExitCode::SUCCESS
+}
+
+/// Streams the screen to a gateway and applies the input it sends back.
+///
+/// This is §6.3's WebSocket JPEG fallback, not the default path — WebRTC is
+/// (§19.6). It exists because the fallback is specified, self-contained, and
+/// the only way to watch a Desktop before the SFU exists.
+fn stream(endpoint: Option<&str>) -> ExitCode {
+    let Some(endpoint) = endpoint else {
+        eprintln!("--stream needs the gateway's ingest URL, e.g. ws://gateway:8080/ingest?token=…");
+        return ExitCode::from(2);
+    };
+
+    let dispatcher = Arc::new(build_dispatcher());
+    println!("streaming to {endpoint}");
+
+    let rt = match tokio::runtime::Runtime::new() {
+        Ok(rt) => rt,
+        Err(e) => {
+            eprintln!("could not start the async runtime: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    rt.block_on(async {
+        // Reconnects on the same curve as the Control Plane channel: a gateway
+        // restart should not leave a Desktop permanently unwatchable.
+        let mut backoff = iapetusd::channel::Backoff::default();
+        loop {
+            let started = std::time::Instant::now();
+            match iapetusd::viewer_link::run(
+                endpoint,
+                Arc::clone(&dispatcher),
+                iapetusd::viewer_link::frame_interval(),
+            )
+            .await
+            {
+                Ok(()) => eprintln!("gateway closed the stream; reconnecting"),
+                Err(e) => eprintln!("stream: {e}"),
+            }
+            if started.elapsed() >= iapetusd::channel::MIN_SESSION_FOR_BACKOFF_RESET {
+                backoff.reset();
+            }
+            tokio::time::sleep(backoff.next(iapetusd::channel::jitter_unit())).await;
+        }
+    })
 }
 
 /// Reads a required environment variable, naming it plainly when absent.

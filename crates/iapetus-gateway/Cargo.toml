@@ -1,0 +1,16 @@
+[package]
+name = "iapetus-gateway"
+description = "Relays a guest's screen to viewers (PRD §6.1 Stream Gateway, §19.6)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+# §19.7 puts the Control Plane on axum + tokio; the gateway sits beside it and
+# shares the stack rather than introducing a second one.
+axum = { workspace = true, features = ["ws"] }
+futures-util = { version = "0.3.34", default-features = false, features = ["sink", "std"] }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "net", "signal", "sync"] }
+tokio-stream.workspace = true

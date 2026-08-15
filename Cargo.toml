@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/iapetus-proto", "crates/iapetusd"]
+members = ["crates/iapetus-gateway", "crates/iapetus-proto", "crates/iapetusd"]
 
 [workspace.package]
 version = "0.1.0"
@@ -19,6 +19,8 @@ protoc-bin-vendored = "3"
 thiserror = "2"
 tokio = { version = "1", default-features = false }
 tokio-stream = "0.1"
+axum = "0.8"
+tokio-tungstenite = "0.24"
 x11rb = { version = "0.13", default-features = false }
 
 [profile.release]

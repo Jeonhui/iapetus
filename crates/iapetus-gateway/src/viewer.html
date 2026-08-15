@@ -1,0 +1,232 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Iapetus viewer</title>
+<!--
+  The WebSocket JPEG-diff viewer (PRD §7.5, §6.3 fallback).
+
+  §7.5 insists this is a remote desktop, not a monitoring screen: mouse,
+  keyboard, scroll, and drag, "indistinguishable from a local PC" (V-02). It
+  also requires a visible indicator of who holds the lease and a badge when the
+  stream has degraded (V-12) — this path is always degraded, so the badge is
+  permanent here.
+-->
+<style>
+  :root { color-scheme: dark; }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: #0b0d10; color: #e6e9ef;
+         font: 14px/1.4 ui-sans-serif, system-ui, sans-serif;
+         display: flex; flex-direction: column; height: 100vh; }
+  header { display: flex; align-items: center; gap: 12px; padding: 8px 14px;
+           background: #14181e; border-bottom: 1px solid #222831; flex: none; }
+  h1 { font-size: 13px; font-weight: 600; margin: 0; letter-spacing: .02em; }
+  .badge { font-size: 11px; padding: 2px 8px; border-radius: 999px;
+           border: 1px solid #3a4150; }
+  .fallback { color: #f0b429; border-color: #6b5116; background: #2a2110; }
+  .lease   { color: #7ee2a8; border-color: #1f5e3c; background: #12241a; }
+  .lease.agent { color: #9db4ff; border-color: #2c3d78; background: #151b2e; }
+  .stat { margin-left: auto; font-variant-numeric: tabular-nums; color: #8b95a5; font-size: 12px; }
+  main { flex: 1; display: grid; place-items: center; overflow: auto; padding: 12px; }
+  canvas { background: #000; max-width: 100%; max-height: 100%;
+           outline: none; cursor: default; box-shadow: 0 0 0 1px #222831; }
+  canvas:focus { box-shadow: 0 0 0 2px #3b6fd4; }
+  #ime { position: absolute; opacity: 0; pointer-events: none; width: 1px; height: 1px; }
+</style>
+
+<header>
+  <h1>Iapetus</h1>
+  <span class="badge fallback" title="WebRTC unavailable; running the §6.3 JPEG fallback at 5–10fps">
+    fallback · JPEG
+  </span>
+  <span class="badge lease" id="lease">you are operating</span>
+  <span class="stat" id="stat">connecting…</span>
+</header>
+
+<main>
+  <!-- tabindex so the canvas can hold keyboard focus -->
+  <canvas id="screen" tabindex="0" width="640" height="360"></canvas>
+</main>
+<!--
+  Hangul cannot be sent key by key: the guest runs its own IME, so raw keystrokes
+  would be composed twice and produce doubled jamo. §7.5 requires intercepting
+  the browser's composition and sending the finished string as one `type` action,
+  which needs a real focusable text input to compose into.
+-->
+<textarea id="ime" autocomplete="off" autocapitalize="off" spellcheck="false"></textarea>
+
+<script>
+const cv = document.getElementById('screen');
+const ctx = cv.getContext('2d', { alpha: false });
+const statEl = document.getElementById('stat');
+const ime = document.getElementById('ime');
+
+let screenW = 0, screenH = 0;
+let tilesApplied = 0, bytes = 0, lastSeq = -1;
+
+// The token comes from the page URL. In the product this is the §8.1 Viewer
+// Token already embedded in `viewer_url`, which is why that field is a complete
+// address rather than a resource the page has to go fetch.
+const token = new URLSearchParams(location.search).get('token') || '';
+const proto = location.protocol === 'https:' ? 'wss' : 'ws';
+const ws = new WebSocket(`${proto}://${location.host}/view?token=${encodeURIComponent(token)}`);
+ws.binaryType = 'arraybuffer';
+
+ws.onopen = () => statEl.textContent = 'connected';
+ws.onclose = (ev) => {
+  // 1008/1006 right after connecting is almost always a rejected token, and
+  // "disconnected" would send the user looking at their network instead.
+  statEl.textContent = tilesApplied === 0 ? 'refused — check the viewer token' : 'disconnected';
+};
+ws.onmessage = async (ev) => {
+  if (typeof ev.data === 'string') {
+    // The gateway tells us we fell behind and lost updates; the canvas now has
+    // holes, so ask for a full frame instead of applying the next diff onto it.
+    if (JSON.parse(ev.data).type === 'lagged') send({ type: 'keyframe' });
+    return;
+  }
+  await applyUpdate(new DataView(ev.data));
+};
+
+async function applyUpdate(dv) {
+  const seq = dv.getUint32(0);
+  const w = dv.getUint16(4), h = dv.getUint16(6);
+  const keyframe = dv.getUint8(8) === 1;
+  const count = dv.getUint16(10);
+
+  if (w !== screenW || h !== screenH) {
+    screenW = w; screenH = h;
+    cv.width = w; cv.height = h;
+    fitCanvas();
+  }
+
+  let off = 12;
+  const draws = [];
+  for (let i = 0; i < count; i++) {
+    const x = dv.getUint16(off), y = dv.getUint16(off + 2);
+    const tw = dv.getUint16(off + 4), th = dv.getUint16(off + 6);
+    const len = dv.getUint32(off + 8);
+    off += 12;
+    const blob = new Blob([new Uint8Array(dv.buffer, dv.byteOffset + off, len)], { type: 'image/jpeg' });
+    off += len;
+    bytes += len;
+    // Decode off the main thread; drawing in arrival order is not required
+    // because tiles never overlap.
+    draws.push(createImageBitmap(blob).then(bm => { ctx.drawImage(bm, x, y, tw, th); bm.close(); }));
+  }
+  await Promise.all(draws);
+
+  tilesApplied += count;
+  lastSeq = seq;
+  statEl.textContent = `${w}×${h} · seq ${seq} · ${tilesApplied} tiles · ${(bytes / 1024).toFixed(0)} KiB`
+    + (keyframe ? ' · key' : '');
+}
+
+function fitCanvas() {
+  // Nothing to compute: CSS max-width/max-height letterbox it. Coordinates are
+  // converted from the rendered box below, so any scale is handled there.
+}
+
+function send(msg) {
+  if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(msg));
+}
+
+// ── Coordinates ────────────────────────────────────────────
+// The canvas is letterboxed to fit the window, so a click at CSS pixel (x, y)
+// is not a click at guest pixel (x, y). §8.2 requires integer coordinates and
+// rejects out-of-screen ones, so these are rounded and clamped here rather than
+// sent as fractions the guest would refuse.
+function toGuest(ev) {
+  const r = cv.getBoundingClientRect();
+  const x = Math.round((ev.clientX - r.left) * (cv.width / r.width));
+  const y = Math.round((ev.clientY - r.top) * (cv.height / r.height));
+  return {
+    x: Math.min(Math.max(x, 0), cv.width - 1),
+    y: Math.min(Math.max(y, 0), cv.height - 1),
+  };
+}
+
+const BUTTON = ['left', 'middle', 'right'];
+
+// ── Mouse ──────────────────────────────────────────────────
+// §7.5: a person dragging produces 60–120 events per second, and turning each
+// into an action would blow §8.2's request cap. Motion is coalesced to one per
+// animation frame and only the newest position is sent.
+let pendingMove = null, moveScheduled = false;
+cv.addEventListener('mousemove', (ev) => {
+  pendingMove = toGuest(ev);
+  if (moveScheduled) return;
+  moveScheduled = true;
+  requestAnimationFrame(() => {
+    moveScheduled = false;
+    if (pendingMove) { send({ type: 'mouse.move', ...pendingMove }); pendingMove = null; }
+  });
+});
+
+cv.addEventListener('mousedown', (ev) => {
+  ev.preventDefault();
+  cv.focus();
+  // Position first: the guest's button.down carries no coordinate, so a press
+  // that did not move the pointer there lands wherever it happened to be.
+  send({ type: 'mouse.move', ...toGuest(ev) });
+  send({ type: 'mouse.down', button: BUTTON[ev.button] || 'left' });
+});
+cv.addEventListener('mouseup', (ev) => {
+  ev.preventDefault();
+  send({ type: 'mouse.up', button: BUTTON[ev.button] || 'left' });
+});
+cv.addEventListener('contextmenu', (ev) => ev.preventDefault());
+cv.addEventListener('wheel', (ev) => {
+  ev.preventDefault();
+  send({ type: 'scroll', ...toGuest(ev), dx: Math.sign(ev.deltaX), dy: Math.sign(ev.deltaY) });
+}, { passive: false });
+
+// ── Keyboard ───────────────────────────────────────────────
+const NAMED = {
+  Enter: 'Enter', Tab: 'Tab', Escape: 'Escape', Backspace: 'BackSpace', Delete: 'Delete',
+  ArrowUp: 'Up', ArrowDown: 'Down', ArrowLeft: 'Left', ArrowRight: 'Right',
+  Home: 'Home', End: 'End', PageUp: 'Page_Up', PageDown: 'Page_Down', ' ': 'space',
+};
+
+cv.addEventListener('keydown', (ev) => {
+  // While composing, the IME owns the keystrokes; forwarding them too would
+  // type the jamo and then the finished syllable.
+  if (ev.isComposing) return;
+  ev.preventDefault();
+
+  const mods = [];
+  if (ev.ctrlKey) mods.push('ctrl');
+  if (ev.altKey) mods.push('alt');
+  if (ev.shiftKey) mods.push('shift');
+  if (ev.metaKey) mods.push('super');
+
+  const named = NAMED[ev.key];
+  if (named) { send({ type: 'key', keys: [...mods, named].join('+') }); return; }
+  if (ev.key.length === 1) {
+    // A modified letter is a shortcut and must go as a combo; a bare one is
+    // text and goes through `type`, which is the path with IME support.
+    if (mods.filter(m => m !== 'shift').length) {
+      send({ type: 'key', keys: [...mods, ev.key.toLowerCase()].join('+') });
+    } else {
+      send({ type: 'type', text: ev.key });
+    }
+  }
+});
+
+// Focusing the canvas also focuses the hidden textarea, so the browser will
+// start an IME composition when the user switches to Hangul.
+cv.addEventListener('focus', () => ime.focus({ preventScroll: true }));
+ime.addEventListener('compositionend', (ev) => {
+  if (ev.data) send({ type: 'type', text: ev.data });
+  ime.value = '';
+});
+ime.addEventListener('input', (ev) => {
+  // Non-composed input that reached the textarea directly (paste, some IMEs).
+  if (!ev.isComposing && ime.value) { send({ type: 'type', text: ime.value }); ime.value = ''; }
+});
+ime.addEventListener('keydown', (ev) => {
+  if (ev.isComposing) return;
+  cv.dispatchEvent(new KeyboardEvent('keydown', ev));
+  ev.preventDefault();
+});
+
+cv.focus();
+</script>

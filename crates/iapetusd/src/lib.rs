@@ -9,3 +9,5 @@ pub mod dispatch;
 pub mod encode;
 pub mod frame;
 pub mod platform;
+pub mod stream;
+pub mod viewer_link;
