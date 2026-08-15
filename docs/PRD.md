@@ -5,7 +5,7 @@
 
 | Field | Value |
 |---|---|
-| Version | **v0.9.1** |
+| Version | **v0.9.2** |
 | Last updated | 2026-08-15 |
 | Status | Draft — before technical validation |
 | Document owner | Product (Jeonhui Lee) |
@@ -28,8 +28,8 @@
 | v0.7 | 2026-08-15 | **Interface specification filled in (implementation-readiness audit).** Review to date had only attacked what was arguable; the uncontested enumeration work sat empty. Added §8.2 API conventions (ULID identifiers, RFC 3339, integer coordinates, error envelope, cursor pagination, eleven caps, timeouts, encoding, versioning), §8.3 resource schemas (every Desktop field plus `spec_tier` tiering; Image/Policy/Secret/Webhook; Snapshot and Organization cut from v1), §8.4 async job model with control lease, owner, and session bodies, §8.7 event envelope with per-type payloads and SSE reconnection, §19.5 `iapetusd` transport contract (gRPC/Protobuf, vsock health probe, no retransmission), §19.6 guest↔gateway media contract, and the §7.5 viewer input path. New `DELETING` state. Idempotency keys made mandatory. Six error codes added |
 | v0.8 | 2026-08-15 | **Propagation misses corrected (re-audit).** v0.7 had written its fixes as *new standalone sections*, leaving the old normative text in place — resolved by adding a **precedence rule** in §0 and aligning the §5 examples (`spec` → `spec_tier`, `bounds` as an object), the §8.4 webhook wire format, the §9.4 audit record, and the §10.3 deletion flow to §8.2/§8.3. **§12.4 re-derived for four tiers** (per-tier host pools, `light` capped by CPU, per-desktop encoding reservation) — the one part that had regressed in v0.7. Idempotency key contract specified (format and `(project, session, endpoint)` scope) with the WebSocket and viewer paths explicitly exempt. Phase 1 health probe branched per runtime (Docker `exec` / vsock / hvsocket). Image `source` added (registry only in v1), `PUT`/`DELETE .../policy` added, `viewer_url` defined. Boundary between this document and the API reference stated |
 | **v0.9** | 2026-08-15 | **Density and authority re-examined; auth completed.** §6.4 gained the **rejection of multi-session** (isolation ladder, break-even at 28% activity ratio) and the **deferral of Desktop Group** (2.3× better for same-trust-domain parallelism, designed so the API model is unchanged, v2). §8.1 gained a token signing scheme — Ed25519, JWKS, 90-day rotation, the `jti` claim that revocation had been operating on without ever defining, and `orig_iat` for total-lifetime enforcement. §12.5 added **six lightweighting levers**. §12.4 corrected `light` from 40 to **34** (the 2.5:1 ceiling includes the encoding reservation) and three stale `28`s removed. Precedence rule gained a **single-source-per-topic** layer. Control lease arbitration gained a row for agent-versus-agent contention |
-
 | v0.9.1 | 2026-08-15 | Document translated to English. No design changes; terminology fixed against a locked glossary and verified mechanically. The Korean original is retained at `docs/PRD.ko.md` |
+| **v0.9.2** | 2026-08-15 | **Embedding contract added (parent-product integration audit).** V-09 had committed the viewer to iframe embedding without a single rule making it safe or workable: no frame policy, no origin allowlist, and no way for the host page to learn viewer-local state. §7.5 gained **Embedding in a parent product** — framing denied by default, per-project `embed_origins` (exact match, no wildcard subdomains), a second in-page origin check because CSP fails open where it is not enforced, and a versioned `postMessage` contract. The `token_expiring` message closes a real hole: an embedded viewer would otherwise go black at the §8.1 eight-hour refresh cap with no signal to the host. §9.2 gained the matching policy row and §8.3 the matching schema field, project-level only. A blank line that had split the revision table in two was removed |
 
 ### How to read this
 
@@ -1187,6 +1187,35 @@ browser ──DataChannel──► stream gateway ──§19.5 control stream─
 
 **Hangul input:** the viewer intercepts the browser's IME composition events (`compositionend`) and **sends the completed string as a `type` action.** Sending key by key produces double composition against the guest IME.
 
+#### Embedding in a parent product (V-09)
+
+**A parent product's users never see the Iapetus dashboard.** §14.1 argues that a developer who cannot watch the screen does not understand the product; for a customer embedding Iapetus, the same argument applies to *their* users, and the only surface those users ever reach is the customer's own page. `viewer_url` is therefore designed to be framed, and the rules that make framing safe are fixed here rather than discovered during integration.
+
+| Decision | Value | Reasoning |
+|---|---|---|
+| Framing default | **Denied.** `Content-Security-Policy: frame-ancestors 'none'` | `viewer_url` carries a token in the query string and can hold `WRITE`. A default-open frame policy makes clickjacking against a live desktop a one-line attack |
+| Opt-in | `embed_origins[]` on the project policy (§9.2) | Per project, exact-origin match. No wildcard subdomains: `*.example.com` includes whatever subdomain an attacker gets to host content on |
+| Enforcement | `frame-ancestors` emitted from `embed_origins`, **and** the viewer re-checks `document.referrer` / `window.parent.origin` before enabling input | CSP alone fails open on browsers that do not enforce it; the second check degrades to READ rather than to nothing |
+| Cross-origin isolation | The viewer sets no `SharedArrayBuffer` requirement | Demanding COOP/COEP would force the parent page to adopt them too, breaking most existing pages for a capability the viewer does not need |
+
+**The parent page and the viewer talk over `postMessage`.** The parent already knows the Desktop id and can call the REST API; what it cannot get from outside the frame is *viewer-local* state — whether this user currently holds the lease, whether WebRTC fell back, whether the token hit its refresh cap. Polling the API for the first of those would also lag the thing it describes.
+
+Every message carries `{ source: "iapetus", version: 1, type, data }`, and each side **must** verify `event.origin` before acting.
+
+| Direction | `type` | `data` | Purpose |
+|---|---|---|---|
+| viewer → parent | `ready` | `desktop_id`, `session_id` | The stream is up. Before this, commands are dropped |
+| viewer → parent | `control` | `level` ∈ `read`\|`write`, `holder{type,id}` | Lets the parent render its own "agent is operating" state instead of two competing indicators |
+| viewer → parent | `quality` | `mode` ∈ `webrtc`\|`fallback`, `fps` | V-12. The parent may already have a place to show degradation |
+| viewer → parent | `token_expiring` | `expires_in_sec`, `capped` | `capped: true` means the 8-hour `orig_iat` cap is reached (§8.1) and self-refresh will not save it. **Without this the embedded viewer simply goes black at hour eight** |
+| viewer → parent | `error` | `code`, `message` | §8.9 codes, so the parent needs no second error vocabulary |
+| parent → viewer | `set_token` | `token` | Hands in a freshly minted Viewer Token. The only party that can authenticate the end user is the parent, which is why the refresh cap resolves here and not in the browser |
+| parent → viewer | `request_control` / `release_control` | — | Drives §7.5's one-button takeover from the parent's own chrome |
+| parent → viewer | `set_chrome` | `hide[]` ∈ `toolbar`\|`status` | Lets the parent supply its own UI. **The lease indicator cannot be hidden** — a user who cannot tell whether the agent is driving is exactly the failure §7.5 exists to prevent |
+
+**`set_token` does not widen authority.** The token is validated against the same Desktop and actor as the one the frame opened with; a token for a different Desktop is rejected rather than followed, because otherwise a compromised parent page could pivot one embedded frame across a project's desktops.
+
+
 ---
 ## 8. External Interface Specification
 
@@ -1590,10 +1619,12 @@ Project policy and Desktop overrides use **the same document shape**, and a read
   "audit_params": "digest",
   "privilege_mode": "owner",
   "approval_required": [],
-  "masking": [{ "window_title_regex": "^Bank", "region": null }]
+  "masking": [{ "window_title_regex": "^Bank", "region": null }],
+  "embed_origins": []
 }
 ```
 
+- `embed_origins` is **project-level only** (§7.5). A Desktop-level override would let one Desktop widen the set the project allowed, which is the wrong direction for a control that exists to bound who may frame a live session.
 - **Merging replaces whole top-level keys.** There is no deep merge: partially inheriting `deny_domains` would leave nobody certain which list is in force.
 - `GET /v1/desktops/{id}/policy` returns the merged result together with each key's origin (`project` \| `desktop`).
 
@@ -2129,6 +2160,7 @@ host network namespace / vNIC
 | Human approval for high-risk actions | Control Plane | Off |
 | Forced session recording | Control Plane | Off |
 | `privilege_mode` | Guest (opt-in) | `owner` (unconstrained) |
+| `embed_origins[]` — origins allowed to frame the viewer (§7.5) | Control Plane (CSP `frame-ancestors`) | Empty (framing denied) |
 
 ### 9.3 Handling credentials
 
