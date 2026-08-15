@@ -257,17 +257,29 @@ fn a_scaled_capture_still_reports_the_physical_coordinate_frame() {
 }
 
 #[test]
-fn capture_produces_opaque_pixels_not_a_transparent_image() {
+fn a_screenshot_is_opaque_not_a_transparent_image() {
     require_x11!();
 
     // X leaves the fourth byte undefined on 32-bit visuals. Passing it through
-    // yields an image that is entirely transparent — which looks like a black
-    // screen to a viewer and like a blank screen to an agent.
+    // yields an image that is entirely transparent — a black screen to a viewer
+    // and a blank one to an agent.
+    //
+    // The check is on the encoded screenshot rather than the raw frame: capture
+    // now hands back the server's own BGRX so the streaming path can skip a
+    // whole-frame conversion, and alpha is forced where RGBA is actually
+    // produced. Asserting on the raw buffer would test a contract that has
+    // moved; this asserts the one an agent actually receives.
+    use iapetus_proto::v1::ImageFormat;
+    use iapetusd::encode;
+
     let display = X11Display::open().expect("no display");
     let f = display.capture(Some(Rect { x: 0, y: 0, width: 16, height: 16 })).expect("capture");
+    let e = encode::encode(&f, ImageFormat::Png, 0, None).expect("encode");
+
+    let img = image::load_from_memory(&e.bytes).expect("not a decodable image").to_rgba8();
     assert!(
-        f.pixels.chunks_exact(4).all(|p| p[3] == 0xFF),
-        "alpha channel was not forced opaque"
+        img.pixels().all(|p| p.0[3] == 0xFF),
+        "the encoded screenshot is not opaque"
     );
 }
 

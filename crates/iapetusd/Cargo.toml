@@ -16,12 +16,15 @@ tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time", "sy
 tokio-stream.workspace = true
 # Pure Rust: speaks the X protocol over a socket, so the container needs no
 # libx11-dev and cross-compilation stays simple.
-x11rb = { workspace = true, optional = true, features = ["xtest", "damage"] }
+x11rb = { workspace = true, optional = true, features = ["xtest", "damage", "shm"] }
+# mmap for the MIT-SHM capture path. Linux-only, and pulled in only with x11.
+libc = { version = "0.2", optional = true }
 image = { version = "0.25.6", default-features = false, features = ["png", "jpeg", "webp"] }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
 tokio-tungstenite.workspace = true
 futures-util = { version = "0.3.34", default-features = false, features = ["sink", "std"] }
+jpeg-encoder = { version = "0.6.1", features = ["simd"] }
 
 [dev-dependencies]
 image = { version = "0.25.6", default-features = false, features = ["png"] }
@@ -31,4 +34,4 @@ tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time", "sy
 default = []
 # The real X11 backend. Off by default so the crate builds and tests on any
 # host; CI enables it inside the Linux container (§15.1 L2).
-x11 = ["dep:x11rb"]
+x11 = ["dep:x11rb", "dep:libc"]

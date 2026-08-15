@@ -49,6 +49,23 @@ pub struct ScreenInfo {
     pub monitor_count: u32,
 }
 
+/// How a `Frame`'s bytes are laid out.
+///
+/// Capture backends produce BGRX natively — X11's Z_PIXMAP on a little-endian
+/// 24/32-bit visual, and DXGI's B8G8R8A8 on Windows. Converting the whole frame
+/// to RGBA costs a pass over every pixel, and the streaming path does not need
+/// it: a diff does not care about channel order, and only the tiles that
+/// actually changed are ever encoded. So the format travels with the frame and
+/// the conversion happens where it is genuinely required.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PixelFormat {
+    /// Red, green, blue, alpha. What `screenshot` responses are encoded from.
+    Rgba,
+    /// Blue, green, red, and a byte X leaves undefined — never trust it as
+    /// alpha, or the image comes out fully transparent.
+    Bgrx,
+}
+
 /// One captured frame.
 ///
 /// `captured_at` is what makes the §6.3 freshness contract checkable: a caller
@@ -57,8 +74,9 @@ pub struct ScreenInfo {
 pub struct Frame {
     pub width: u32,
     pub height: u32,
-    /// Tightly packed RGBA, `width * height * 4` bytes.
+    /// Tightly packed, `width * height * 4` bytes, laid out per `format`.
     pub pixels: Vec<u8>,
+    pub format: PixelFormat,
     pub captured_at: SystemTime,
 }
 
@@ -66,6 +84,19 @@ impl Frame {
     #[must_use]
     pub fn byte_len(&self) -> usize {
         (self.width as usize) * (self.height as usize) * 4
+    }
+
+    /// Reads one pixel as RGB, whatever the frame's layout.
+    ///
+    /// The three channels are returned rather than a converted buffer because
+    /// every caller that needs RGB is writing into an encoder's input anyway.
+    #[must_use]
+    pub fn rgb_at(&self, offset: usize) -> [u8; 3] {
+        let p = &self.pixels[offset..offset + 4];
+        match self.format {
+            PixelFormat::Rgba => [p[0], p[1], p[2]],
+            PixelFormat::Bgrx => [p[2], p[1], p[0]],
+        }
     }
 }
 
@@ -139,6 +170,9 @@ pub trait Display: Send + Sync {
     /// Implementations must stamp `captured_at` at the moment the pixels are
     /// read, not when the call was made — the difference is exactly what the
     /// freshness contract measures.
+    ///
+    /// The frame may be returned in the backend's native layout; callers read
+    /// `format` rather than assuming RGBA.
     fn capture(&self, region: Option<Rect>) -> Result<Frame>;
 
     fn screen_info(&self) -> Result<ScreenInfo>;

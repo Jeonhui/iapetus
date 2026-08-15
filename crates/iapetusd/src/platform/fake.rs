@@ -9,8 +9,8 @@ use std::sync::Mutex;
 use std::time::{Duration, SystemTime};
 
 use super::{
-    Button, Display, Frame, Input, LaunchSpec, PlatformError, Process, Rect, Result, ScreenInfo,
-    WindowInfo, Windows,
+    Button, Display, Frame, Input, LaunchSpec, PixelFormat, PlatformError, Process, Rect, Result,
+    ScreenInfo, WindowInfo, Windows,
 };
 
 /// A record of what was asked of the input driver, so tests can assert on it.
@@ -67,6 +67,7 @@ impl Display for FakeDisplay {
             width: w,
             height: h,
             pixels: vec![0u8; (w as usize) * (h as usize) * 4],
+            format: PixelFormat::Rgba,
             captured_at: self.now(),
         })
     }

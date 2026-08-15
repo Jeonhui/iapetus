@@ -40,6 +40,7 @@ fn main() -> ExitCode {
         Some("--connect") => connect(),
         Some("--screenshot") => screenshot(args.get(1).map(String::as_str)),
         Some("--stream") => stream(args.get(1).map(String::as_str)),
+        Some("--stream-bench") => stream_bench(args.get(1).and_then(|s| s.parse().ok()).unwrap_or(10)),
         Some(other) => {
             eprintln!("unknown argument: {other}");
             usage();
@@ -59,6 +60,7 @@ fn usage() {
          --connect        dial the Control Plane and serve actions (§19.5)\n\
          --screenshot F   capture the screen through the real pipeline into F (png)\n\
          --stream URL     push the screen to a stream gateway and take its input\n\
+         --stream-bench N run the capture and encode loop for N seconds and report\n\
          --supervise-x11  hold the display session open (the container entry point)\n\
          --selftest       exercise the platform layer and report\n\
          --version        print version and supported protocol range"
@@ -208,6 +210,85 @@ fn stream(endpoint: Option<&str>) -> ExitCode {
             tokio::time::sleep(backoff.next(iapetusd::channel::jitter_unit())).await;
         }
     })
+}
+
+/// Measures where a streamed frame's time and bytes actually go.
+///
+/// §12.4 sizes hosts on encoding cost, and "the viewer feels slow" has at least
+/// three different causes with three different fixes — capture, hashing, and
+/// JPEG. Guessing which one is dominant is how the wrong thing gets optimised.
+fn stream_bench(seconds: u64) -> ExitCode {
+    use iapetusd::stream::{TileEncoder, DEFAULT_QUALITY};
+
+    let d = build_dispatcher();
+    let mut enc = TileEncoder::new(DEFAULT_QUALITY);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(seconds);
+
+    let (mut cap_us, mut hash_us, mut jpeg_us) = (Vec::new(), Vec::new(), Vec::new());
+    let (mut frames, mut changed, mut bytes) = (0u64, 0u64, 0u64);
+    // The keyframe re-encodes every tile, which is exactly the all-changed
+    // worst case. Reported on its own because one frame in a thousand vanishes
+    // into a p95 — and it is the number host capacity has to be sized against.
+    let mut key = (0usize, 0usize, 0u64, 0u64); // tiles, bytes, diff_us, jpeg_us
+
+    while std::time::Instant::now() < deadline {
+        let t0 = std::time::Instant::now();
+        let frame = match d.capture_for_stream() {
+            Ok(f) => f,
+            Err(e) => {
+                eprintln!("capture: {e}");
+                return ExitCode::FAILURE;
+            }
+        };
+        cap_us.push(t0.elapsed().as_micros() as u64);
+
+        let update = match enc.encode(&frame, false) {
+            Ok(u) => u,
+            Err(e) => {
+                eprintln!("encode: {e}");
+                return ExitCode::FAILURE;
+            }
+        };
+        let s = enc.stats();
+        hash_us.push(s.hash.as_micros() as u64);
+        jpeg_us.push(s.jpeg.as_micros() as u64);
+        frames += 1;
+        changed += s.tiles_changed as u64;
+        bytes += s.bytes as u64;
+        if s.tiles_changed > key.0 {
+            key = (
+                s.tiles_changed,
+                s.bytes,
+                s.hash.as_micros() as u64,
+                s.jpeg.as_micros() as u64,
+            );
+        }
+        let _ = update;
+    }
+
+    let pct = |v: &mut Vec<u64>, p: f64| -> u64 {
+        if v.is_empty() {
+            return 0;
+        }
+        v.sort_unstable();
+        v[(((v.len() - 1) as f64) * p) as usize]
+    };
+
+    println!();
+    println!("frames {frames} over {seconds}s ({:.1}/s achievable)", frames as f64 / seconds as f64);
+    println!("changed tiles {changed} ({:.1}/frame), {:.0} KiB total", changed as f64 / frames.max(1) as f64, bytes as f64 / 1024.0);
+    println!();
+    println!("               p50        p95        (microseconds)");
+    println!("capture     {:>8}   {:>8}", pct(&mut cap_us, 0.5), pct(&mut cap_us, 0.95));
+    println!("diff        {:>8}   {:>8}", pct(&mut hash_us, 0.5), pct(&mut hash_us, 0.95));
+    println!("jpeg        {:>8}   {:>8}", pct(&mut jpeg_us, 0.5), pct(&mut jpeg_us, 0.95));
+    println!();
+    println!("worst case — every tile changed (the keyframe):");
+    println!("  {} tiles, {:.0} KiB, diff {}us, jpeg {}us", key.0, key.1 as f64 / 1024.0, key.2, key.3);
+    let worst_total = pct(&mut cap_us, 0.5) + key.2 + key.3;
+    println!("  capture+diff+jpeg = {}us → {:.1} fps ceiling under continuous full-screen change",
+             worst_total, 1_000_000.0 / worst_total.max(1) as f64);
+    ExitCode::SUCCESS
 }
 
 /// Reads a required environment variable, naming it plainly when absent.

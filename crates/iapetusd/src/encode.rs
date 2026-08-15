@@ -20,7 +20,7 @@ use std::io::Cursor;
 use iapetus_proto::limits;
 use iapetus_proto::v1::ImageFormat;
 
-use crate::platform::{Frame, PlatformError, Result};
+use crate::platform::{Frame, PixelFormat, PlatformError, Result};
 
 /// The largest encoded image the guest will put on the wire.
 ///
@@ -74,7 +74,19 @@ pub fn encode(frame: &Frame, format: ImageFormat, quality: i32, scale: Option<f6
 
     let (w, h) = scaled_size(frame.width, frame.height, scale)?;
 
-    let img = image::RgbaImage::from_raw(frame.width, frame.height, frame.pixels.clone())
+    // A `screenshot` genuinely needs RGBA — PNG and WebP carry alpha — so the
+    // conversion happens here, on the path that asked for an image, rather than
+    // on every captured frame. Alpha is forced opaque because a BGRX capture's
+    // fourth byte is undefined and passing it through yields a transparent
+    // picture.
+    let mut rgba = frame.pixels.clone();
+    if frame.format == PixelFormat::Bgrx {
+        for p in rgba.chunks_exact_mut(4) {
+            p.swap(0, 2);
+            p[3] = 0xFF;
+        }
+    }
+    let img = image::RgbaImage::from_raw(frame.width, frame.height, rgba)
         .ok_or_else(|| PlatformError::CaptureFailed("frame buffer is the wrong length".into()))?;
 
     let img = if (w, h) == (frame.width, frame.height) {
@@ -158,7 +170,7 @@ mod tests {
                 pixels.extend_from_slice(&[(x % 256) as u8, (y % 256) as u8, ((x + y) % 256) as u8, 0xFF]);
             }
         }
-        Frame { width: w, height: h, pixels, captured_at: SystemTime::now() }
+        Frame { width: w, height: h, pixels, format: PixelFormat::Rgba, captured_at: SystemTime::now() }
     }
 
     fn decode(bytes: &[u8]) -> (u32, u32) {
@@ -175,6 +187,24 @@ mod tests {
             assert_eq!(decode(&e.bytes), (64, 48), "{f:?} decoded to the wrong size");
             assert_eq!((e.width, e.height), (64, 48));
         }
+    }
+
+    #[test]
+    fn a_bgrx_capture_encodes_with_its_channels_the_right_way_round() {
+        // The real X11 and DXGI backends hand back BGRX. Getting this wrong
+        // swaps red and blue in every screenshot an agent ever sees, and the
+        // result still decodes, so nothing else would catch it.
+        let px = vec![10u8, 20, 30, 0x00]; // B=10 G=20 R=30, X undefined
+        let f = Frame {
+            width: 1,
+            height: 1,
+            pixels: px,
+            format: PixelFormat::Bgrx,
+            captured_at: SystemTime::now(),
+        };
+        let e = encode(&f, ImageFormat::Png, 0, None).unwrap();
+        let out = image::load_from_memory(&e.bytes).unwrap().to_rgba8();
+        assert_eq!(out.get_pixel(0, 0).0, [30, 20, 10, 0xFF], "channels or alpha are wrong");
     }
 
     #[test]
@@ -246,6 +276,7 @@ mod tests {
             width: over,
             height: 1,
             pixels: vec![0; (over as usize) * 4],
+            format: PixelFormat::Rgba,
             captured_at: SystemTime::now(),
         };
         assert!(encode(&f, ImageFormat::Png, 0, None).is_err());
@@ -259,6 +290,7 @@ mod tests {
             width: 64,
             height: 64,
             pixels: vec![0; 10],
+            format: PixelFormat::Rgba,
             captured_at: SystemTime::now(),
         };
         assert!(encode(&f, ImageFormat::Png, 0, None).is_err());
