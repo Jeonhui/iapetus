@@ -9,10 +9,12 @@
 use std::process::ExitCode;
 use std::sync::Arc;
 
+use iapetusd::catalog::{self, Catalog};
 use iapetusd::channel::{self, ChannelConfig};
 use iapetusd::dispatch::Dispatcher;
 use iapetusd::frame::FrameSource;
 use iapetusd::platform::fake::{FakeDisplay, FakeInput};
+use iapetusd::platform::unix::UnixProcess;
 use iapetusd::platform::{Button, Display, Input};
 
 /// Protocol range this build speaks (§19.4). The Control Plane picks the
@@ -122,13 +124,35 @@ fn require_env(key: &str) -> std::result::Result<String, String> {
 /// so: a daemon silently accepting clicks that go nowhere is the failure mode
 /// this avoids.
 fn build_dispatcher() -> Dispatcher {
+    // A malformed catalog is a broken image, so it is reported rather than
+    // degraded to empty — otherwise every key looks simply absent (§5.5).
+    let catalog = match Catalog::load(catalog::DEFAULT_PATH) {
+        Ok(c) => {
+            println!("catalog: {} app(s) from {}", c.len(), catalog::DEFAULT_PATH);
+            c
+        }
+        Err(e) => {
+            eprintln!("catalog: {e}; continuing with none — launch by command still works");
+            Catalog::empty()
+        }
+    };
+
     #[cfg(feature = "x11")]
     {
         use iapetusd::platform::x11::{X11Display, X11Input};
         match (X11Display::open(), X11Input::open()) {
             (Ok(d), Ok(i)) => {
                 println!("platform: X11");
-                return Dispatcher::new(FrameSource::new(Box::new(d)), Box::new(i));
+                // One connection, shared: capture and window queries see the
+                // same display and fail together if it goes away.
+                let display = std::sync::Arc::new(d);
+                return Dispatcher::new(
+                    FrameSource::new(Box::new(display.clone())),
+                    Box::new(i),
+                )
+                .with_process(Box::new(UnixProcess::new()))
+                .with_windows(Box::new(display))
+                .with_catalog(catalog);
             }
             (Err(e), _) | (_, Err(e)) => {
                 eprintln!("X11 unavailable ({e}); falling back to the in-memory platform");
@@ -140,6 +164,8 @@ fn build_dispatcher() -> Dispatcher {
         FrameSource::new(Box::new(FakeDisplay::new(1920, 1080))),
         Box::new(FakeInput::new().with_screen(1920, 1080)),
     )
+    .with_process(Box::new(UnixProcess::new()))
+    .with_catalog(catalog)
 }
 
 /// Dials the Control Plane and serves actions until it asks the daemon to stop.

@@ -19,6 +19,9 @@ COPY crates/ ./crates/
 # rather than showing up as a confusing runtime failure.
 RUN cargo test -p iapetusd --features x11 --no-run
 
+# The L2 launch test needs xclock (x11-apps, already installed) and the
+# catalog, so the image carries the same file the runtime image ships.
+COPY images/linux-base/apps.json /etc/iapetus/apps.json
 COPY images/linux-base/run-l2.sh /usr/local/bin/run-l2.sh
 RUN chmod +x /usr/local/bin/run-l2.sh
 

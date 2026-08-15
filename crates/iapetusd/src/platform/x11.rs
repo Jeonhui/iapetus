@@ -18,14 +18,17 @@ use std::time::{Duration, Instant, SystemTime};
 use x11rb::connection::Connection;
 use x11rb::protocol::damage::{self, ConnectionExt as _, ReportLevel};
 use x11rb::protocol::xproto::{
-    ConnectionExt as _, GetKeyboardMappingReply, ImageFormat, Keycode, Keysym, Screen, Window,
+    Atom, AtomEnum, ConnectionExt as _, GetKeyboardMappingReply, ImageFormat, Keycode, Keysym,
+    Screen, Window,
 };
 use x11rb::protocol::xtest::ConnectionExt as _;
 use x11rb::protocol::Event;
 use x11rb::rust_connection::RustConnection;
 use x11rb::wrapper::ConnectionExt as _;
 
-use super::{Button, Display, Frame, Input, PlatformError, Rect, Result, ScreenInfo};
+use super::{
+    Button, Display, Frame, Input, PlatformError, Rect, Result, ScreenInfo, WindowInfo, Windows,
+};
 
 fn x11_err<E: std::fmt::Display>(what: &str) -> impl FnOnce(E) -> PlatformError + '_ {
     move |e| PlatformError::CaptureFailed(format!("{what}: {e}"))
@@ -66,6 +69,9 @@ pub struct X11Display {
     /// Present only when the DAMAGE extension is available. Without it,
     /// `wait_for_change` degrades to a timed wait and says so.
     damage: Option<damage::Damage>,
+    /// Interned lazily: a Desktop that never lists windows should not pay four
+    /// round trips at startup.
+    window_atoms: std::sync::OnceLock<WindowAtoms>,
 }
 
 impl X11Display {
@@ -89,7 +95,7 @@ impl X11Display {
             });
         conn.flush().map_err(x11_err("flush"))?;
 
-        Ok(Self { conn, root, width, height, damage })
+        Ok(Self { conn, root, width, height, damage, window_atoms: std::sync::OnceLock::new() })
     }
 
     #[must_use]
@@ -574,5 +580,199 @@ mod tests {
         // A multi-character token that is not a known name must fail rather
         // than silently typing its first letter.
         assert_eq!(resolve_key("ctrlc"), None);
+    }
+}
+
+// ── Windows ──────────────────────────────────────────────────
+//
+// The window list comes from the same connection as capture on purpose: a
+// second connection would mean a second place to notice a lost display and a
+// second set of atoms to intern.
+
+/// Interned once; atom lookups are round trips and this runs in a poll loop.
+struct WindowAtoms {
+    client_list: Atom,
+    net_wm_pid: Atom,
+    net_wm_name: Atom,
+    utf8_string: Atom,
+}
+
+impl X11Display {
+    fn window_atoms(&self) -> Result<&WindowAtoms> {
+        // `OnceLock::get_or_try_init` is still unstable, so the fallible init
+        // is done by hand: intern first, then publish. A failed intern must not
+        // poison the cell — the display may simply not be ready yet.
+        if let Some(a) = self.window_atoms.get() {
+            return Ok(a);
+        }
+        let built = {
+            let intern = |name: &str| -> Result<Atom> {
+                Ok(self
+                    .conn
+                    .intern_atom(false, name.as_bytes())
+                    .map_err(x11_err("intern_atom"))?
+                    .reply()
+                    .map_err(x11_err("intern_atom reply"))?
+                    .atom)
+            };
+            WindowAtoms {
+                client_list: intern("_NET_CLIENT_LIST")?,
+                net_wm_pid: intern("_NET_WM_PID")?,
+                net_wm_name: intern("_NET_WM_NAME")?,
+                utf8_string: intern("UTF8_STRING")?,
+            }
+        };
+        Ok(self.window_atoms.get_or_init(|| built))
+    }
+
+    fn window_pid(&self, win: Window, atoms: &WindowAtoms) -> Option<u32> {
+        let r = self
+            .conn
+            .get_property(false, win, atoms.net_wm_pid, AtomEnum::CARDINAL, 0, 1)
+            .ok()?
+            .reply()
+            .ok()?;
+        let mut vals = r.value32()?;
+        vals.next()
+    }
+
+    fn window_title(&self, win: Window, atoms: &WindowAtoms) -> String {
+        // _NET_WM_NAME is UTF-8; WM_NAME is Latin-1 and is the fallback for
+        // clients that predate the EWMH spec. Reading only the legacy one
+        // mangles every non-ASCII title.
+        for (prop, ty) in [
+            (atoms.net_wm_name, atoms.utf8_string),
+            (AtomEnum::WM_NAME.into(), AtomEnum::STRING.into()),
+        ] {
+            if let Ok(Ok(r)) = self.conn.get_property(false, win, prop, ty, 0, 1024).map(|c| c.reply()) {
+                if !r.value.is_empty() {
+                    return String::from_utf8_lossy(&r.value).into_owned();
+                }
+            }
+        }
+        String::new()
+    }
+
+    fn window_bounds(&self, win: Window) -> Option<Rect> {
+        let geom = self.conn.get_geometry(win).ok()?.reply().ok()?;
+        // get_geometry is relative to the parent, which under a reparenting
+        // window manager is the frame, not the root. Translating gives the
+        // coordinates an agent would actually click at.
+        let t = self
+            .conn
+            .translate_coordinates(win, self.root, 0, 0)
+            .ok()?
+            .reply()
+            .ok()?;
+        Some(Rect {
+            x: i32::from(t.dst_x),
+            y: i32::from(t.dst_y),
+            width: u32::from(geom.width),
+            height: u32::from(geom.height),
+        })
+    }
+}
+
+/// Whether `descendant` is `ancestor`, or is descended from it.
+///
+/// A browser forks: the process that owns the window is usually not the one
+/// that was spawned, so an exact pid match would time out on the very case
+/// §7.2's `wait_for_window` exists for. The `/proc` chain is Linux-only;
+/// elsewhere this degrades to an exact match, which is the honest behaviour
+/// rather than a guess.
+fn is_descendant_of(descendant: u32, ancestor: u32) -> bool {
+    if descendant == ancestor {
+        return true;
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let mut cur = descendant;
+        // Bounded: a cycle in /proc would otherwise hang the poll loop.
+        for _ in 0..64 {
+            let Ok(stat) = std::fs::read_to_string(format!("/proc/{cur}/stat")) else {
+                return false;
+            };
+            // The comm field can contain spaces and parentheses, so ppid is
+            // found after the final ')', not by splitting the whole line.
+            let Some(rest) = stat.rsplit_once(')').map(|(_, r)| r) else { return false };
+            let Some(ppid) = rest.split_whitespace().nth(1).and_then(|s| s.parse::<u32>().ok()) else {
+                return false;
+            };
+            if ppid == ancestor {
+                return true;
+            }
+            if ppid <= 1 {
+                return false;
+            }
+            cur = ppid;
+        }
+    }
+    false
+}
+
+impl Windows for X11Display {
+    fn list(&self) -> Result<Vec<WindowInfo>> {
+        let atoms = self.window_atoms()?;
+        let reply = self
+            .conn
+            .get_property(false, self.root, atoms.client_list, AtomEnum::WINDOW, 0, u32::MAX)
+            .map_err(x11_err("get _NET_CLIENT_LIST"))?
+            .reply()
+            .map_err(x11_err("_NET_CLIENT_LIST reply"))?;
+
+        let Some(ids) = reply.value32() else { return Ok(Vec::new()) };
+        let mut out = Vec::new();
+        for win in ids {
+            let Some(bounds) = self.window_bounds(win) else { continue };
+            out.push(WindowInfo {
+                id: u64::from(win),
+                title: self.window_title(win, atoms),
+                bounds,
+                pid: self.window_pid(win, atoms),
+            });
+        }
+        Ok(out)
+    }
+
+    fn wait_for_window(&self, pid: u32, timeout: Duration) -> Result<Option<WindowInfo>> {
+        let deadline = Instant::now() + timeout;
+        loop {
+            for w in self.list()? {
+                if w.pid.is_some_and(|p| is_descendant_of(p, pid)) {
+                    return Ok(Some(w));
+                }
+            }
+            if Instant::now() >= deadline {
+                return Ok(None);
+            }
+            // Polling rather than waiting on SubstructureNotify: the property
+            // we match on is set by the client after the window is mapped, so
+            // an event-driven wait would fire before the pid is readable.
+            sleep(Duration::from_millis(50));
+        }
+    }
+}
+
+/// Lets the Frame Source and the window driver share one connection, which is
+/// the point made above: a second connection would be a second place to notice
+/// a lost display and a second set of atoms to intern.
+impl Display for std::sync::Arc<X11Display> {
+    fn capture(&self, region: Option<Rect>) -> Result<Frame> {
+        (**self).capture(region)
+    }
+    fn screen_info(&self) -> Result<ScreenInfo> {
+        (**self).screen_info()
+    }
+    fn wait_for_change(&self, timeout: Duration) -> Result<bool> {
+        (**self).wait_for_change(timeout)
+    }
+}
+
+impl Windows for std::sync::Arc<X11Display> {
+    fn list(&self) -> Result<Vec<WindowInfo>> {
+        (**self).list()
+    }
+    fn wait_for_window(&self, pid: u32, timeout: Duration) -> Result<Option<WindowInfo>> {
+        (**self).wait_for_window(pid, timeout)
     }
 }

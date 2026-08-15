@@ -551,7 +551,12 @@ pub async fn connect_and_run(
         .await
         .map_err(|e| ChannelError::Transport(e.to_string()))?;
 
-    let mut client = DaemonChannelClient::new(channel);
+    // Sized against what the encoder may emit. tonic's 4MB default would turn
+    // a large PNG screenshot into a stream error rather than an image, and the
+    // failure would look like a network fault instead of a size limit.
+    let mut client = DaemonChannelClient::new(channel)
+        .max_encoding_message_size(crate::encode::WIRE_MAX_BYTES + 64 * 1024)
+        .max_decoding_message_size(crate::encode::WIRE_MAX_BYTES + 64 * 1024);
 
     let (tx, rx) = mpsc::channel::<GuestFrame>(IN_FLIGHT_DEPTH * 2);
     let mut request = tonic::Request::new(tokio_stream::wrappers::ReceiverStream::new(rx));

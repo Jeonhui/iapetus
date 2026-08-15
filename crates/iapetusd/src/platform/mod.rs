@@ -11,6 +11,12 @@ use std::time::{Duration, SystemTime};
 
 pub mod fake;
 
+// Process spawning is an OS capability, not a display one, so it is gated on
+// the family rather than on the `x11` feature: a Windows build needs its own
+// implementation but the same trait.
+#[cfg(unix)]
+pub mod unix;
+
 // Gated on the feature rather than the OS: x11rb is pure Rust and compiles
 // anywhere, so `cargo check --features x11` gives fast feedback off Linux.
 // Actually connecting requires an X server, which is why the behavioural
@@ -78,6 +84,53 @@ pub enum PlatformError {
 }
 
 pub type Result<T> = std::result::Result<T, PlatformError>;
+
+/// One window, as the guest sees it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WindowInfo {
+    /// The native handle. Rendered as `win_<id>` on the wire (§8.2).
+    pub id: u64,
+    pub title: String,
+    pub bounds: Rect,
+    /// The process that owns it, when the window manager reports one. X11
+    /// clients are not required to set `_NET_WM_PID`, so this can be absent
+    /// even for a window that plainly belongs to a process we launched.
+    pub pid: Option<u32>,
+}
+
+/// What to launch, already resolved from a catalog key or taken verbatim.
+#[derive(Debug, Clone)]
+pub struct LaunchSpec {
+    pub command: String,
+    pub args: Vec<String>,
+    pub cwd: Option<String>,
+    /// §7.3 grants OWNER mode, so this is a convenience for reaching root from
+    /// a non-root daemon — not a privilege boundary.
+    pub elevated: bool,
+}
+
+/// Starting programs.
+pub trait Process: Send + Sync {
+    /// Spawns and returns immediately with the child's pid.
+    ///
+    /// Deliberately not waiting: a GUI program does not exit, and §7.2's
+    /// `wait_for_window` is the caller's way of asking to block on something
+    /// that actually happens.
+    fn launch(&self, spec: &LaunchSpec) -> Result<u32>;
+}
+
+/// Querying and waiting on windows.
+pub trait Windows: Send + Sync {
+    fn list(&self) -> Result<Vec<WindowInfo>>;
+
+    /// Blocks until a window owned by `pid` appears, or the timeout elapses.
+    ///
+    /// Returns `Ok(None)` on timeout rather than an error: a program that
+    /// started but has not drawn yet is a different situation from one that
+    /// failed to start, and collapsing them would make the agent retry a
+    /// launch that already succeeded.
+    fn wait_for_window(&self, pid: u32, timeout: Duration) -> Result<Option<WindowInfo>>;
+}
 
 /// Screen capture.
 pub trait Display: Send + Sync {

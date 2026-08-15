@@ -17,8 +17,12 @@ tokio-stream.workspace = true
 # Pure Rust: speaks the X protocol over a socket, so the container needs no
 # libx11-dev and cross-compilation stays simple.
 x11rb = { workspace = true, optional = true, features = ["xtest", "damage"] }
+image = { version = "0.25.6", default-features = false, features = ["png", "jpeg", "webp"] }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
 
 [dev-dependencies]
+image = { version = "0.25.6", default-features = false, features = ["png"] }
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time", "sync", "test-util"] }
 
 [features]

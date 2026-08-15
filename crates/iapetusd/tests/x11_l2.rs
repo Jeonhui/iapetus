@@ -316,3 +316,65 @@ fn release_all_clears_a_held_modifier() {
         "Ctrl was still latched after release_all"
     );
 }
+
+#[test]
+fn launching_a_program_yields_a_window_the_agent_can_aim_at() {
+    require_x11!();
+
+    // The §16 Phase 1 scenario in miniature: launch something, wait for its
+    // window, and get back coordinates. Every piece of this is invisible to the
+    // unit tests — the pid the window manager reports, the EWMH property that
+    // carries it, and whether the bounds are in root coordinates.
+    use iapetusd::platform::unix::UnixProcess;
+    use iapetusd::platform::{LaunchSpec, Process, Windows};
+
+    let display = X11Display::open().expect("no display");
+    let proc = UnixProcess::new();
+
+    let spec = LaunchSpec {
+        command: "/usr/bin/xclock".into(),
+        args: vec!["-geometry".into(), "200x200+300+250".into()],
+        cwd: None,
+        elevated: false,
+    };
+    let Ok(pid) = proc.launch(&spec) else {
+        eprintln!("skipping: xclock is not installed");
+        return;
+    };
+
+    let found = display
+        .wait_for_window(pid, Duration::from_secs(10))
+        .expect("window query failed");
+    let w = found.unwrap_or_else(|| {
+        panic!("no window appeared for pid {pid} within 10s")
+    });
+
+    assert!(!w.title.is_empty(), "the window reported no title");
+    assert!(
+        w.bounds.width >= 100 && w.bounds.height >= 100,
+        "implausible bounds {:?} — the geometry is probably not in root coordinates",
+        w.bounds
+    );
+
+    // The window must show up in a plain list too, or `window.list` would
+    // disagree with what `app.launch` just reported.
+    let listed = display.list().expect("list failed");
+    assert!(listed.iter().any(|x| x.id == w.id), "the window is missing from the list");
+
+    let _ = std::process::Command::new("kill").arg("-9").arg(pid.to_string()).status();
+}
+
+#[test]
+fn waiting_for_a_window_that_never_opens_times_out_rather_than_erroring() {
+    require_x11!();
+
+    // §7.2: a program that started but drew nothing is a different situation
+    // from one that failed to start. Collapsing them would have the agent retry
+    // a launch that already succeeded.
+    use iapetusd::platform::Windows;
+
+    let display = X11Display::open().expect("no display");
+    // A pid that owns no window. 1 is init, which never maps one.
+    let r = display.wait_for_window(1, Duration::from_millis(300)).expect("must not error");
+    assert!(r.is_none(), "a window was attributed to pid 1");
+}

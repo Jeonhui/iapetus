@@ -38,6 +38,9 @@ RUN useradd -m -s /bin/bash iapetus \
  && chmod 0440 /etc/sudoers.d/iapetus
 
 COPY --from=builder /src/target/release/iapetusd /usr/local/bin/iapetusd
+# §5.5: shortcuts for the programs this image ships. Not a restriction —
+# anything on the disk still launches by path under OWNER mode (§7.3).
+COPY images/linux-base/apps.json /etc/iapetus/apps.json
 COPY images/linux-base/entrypoint.sh /usr/local/bin/entrypoint.sh
 RUN chmod +x /usr/local/bin/entrypoint.sh
 

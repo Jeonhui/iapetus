@@ -8,7 +8,10 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Mutex;
 use std::time::{Duration, SystemTime};
 
-use super::{Button, Display, Frame, Input, PlatformError, Rect, Result, ScreenInfo};
+use super::{
+    Button, Display, Frame, Input, LaunchSpec, PlatformError, Process, Rect, Result, ScreenInfo,
+    WindowInfo, Windows,
+};
 
 /// A record of what was asked of the input driver, so tests can assert on it.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -255,6 +258,88 @@ impl Input for std::sync::Arc<FakeInput> {
     }
     fn release_all(&self) -> Result<()> {
         (**self).release_all()
+    }
+}
+
+/// Records launches instead of starting anything.
+#[derive(Default)]
+pub struct FakeProcess {
+    launched: Mutex<Vec<LaunchSpec>>,
+    next_pid: AtomicU32,
+    /// Commands that should fail, so the "a launch that did not happen must not
+    /// report a pid" path is testable.
+    missing: Mutex<Vec<String>>,
+}
+
+impl FakeProcess {
+    #[must_use]
+    pub fn new() -> Self {
+        Self { next_pid: AtomicU32::new(1000), ..Default::default() }
+    }
+
+    #[must_use]
+    pub fn with_missing(self, command: &str) -> Self {
+        self.missing.lock().unwrap().push(command.to_string());
+        self
+    }
+
+    #[must_use]
+    pub fn launched(&self) -> Vec<LaunchSpec> {
+        self.launched.lock().unwrap().clone()
+    }
+}
+
+impl Process for FakeProcess {
+    fn launch(&self, spec: &LaunchSpec) -> Result<u32> {
+        if self.missing.lock().unwrap().iter().any(|c| c == &spec.command) {
+            return Err(PlatformError::InputRejected(format!("no such program: {}", spec.command)));
+        }
+        self.launched.lock().unwrap().push(spec.clone());
+        Ok(self.next_pid.fetch_add(1, Ordering::SeqCst))
+    }
+}
+
+impl Process for std::sync::Arc<FakeProcess> {
+    fn launch(&self, spec: &LaunchSpec) -> Result<u32> {
+        (**self).launch(spec)
+    }
+}
+
+/// Answers window queries from a script rather than a display server.
+#[derive(Default)]
+pub struct FakeWindows {
+    windows: Mutex<Vec<WindowInfo>>,
+}
+
+impl FakeWindows {
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Makes `wait_for_window` succeed for any pid.
+    #[must_use]
+    pub fn with_window(self, id: u64, title: &str) -> Self {
+        self.windows.lock().unwrap().push(WindowInfo {
+            id,
+            title: title.to_string(),
+            bounds: Rect { x: 0, y: 0, width: 800, height: 600 },
+            pid: None,
+        });
+        self
+    }
+}
+
+impl Windows for FakeWindows {
+    fn list(&self) -> Result<Vec<WindowInfo>> {
+        Ok(self.windows.lock().unwrap().clone())
+    }
+
+    fn wait_for_window(&self, pid: u32, _timeout: Duration) -> Result<Option<WindowInfo>> {
+        Ok(self.windows.lock().unwrap().first().cloned().map(|mut w| {
+            w.pid = Some(pid);
+            w
+        }))
     }
 }
 

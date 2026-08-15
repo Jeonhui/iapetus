@@ -57,6 +57,14 @@ message WindowList {
   bool truncated = 2;                 // capped at 1000 entries (§8.2)
 }
 
+// PRD §7.2: `app.launch` accepts `wait_for_window`, which is only meaningful if
+// the window it waited for can be reported back — an agent that waited and then
+// has to guess which window appeared has gained nothing.
+message AppLaunchResult {
+  int32 pid = 1;
+  optional Window window = 2;         // present only when wait_for_window was set
+}
+
 message ScreenInfo {
   Display display = 1;
   int32 monitor_count = 2;            // always 1 in v1 (§7.2)
@@ -189,6 +197,7 @@ message ActionResult {
     FsList files = 8;
     ShellResult shell = 9;
     ScreenInfo screen = 10;
+    AppLaunchResult app_launch = 11;
   }
 }
 

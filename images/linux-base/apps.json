@@ -1,0 +1,20 @@
+{
+  "apps": [
+    {
+      "key": "terminal",
+      "name": "Terminal",
+      "launch": {
+        "type": "exec",
+        "command": "/usr/bin/xterm"
+      }
+    },
+    {
+      "key": "clock",
+      "name": "Clock",
+      "launch": {
+        "type": "exec",
+        "command": "/usr/bin/xclock"
+      }
+    }
+  ]
+}
