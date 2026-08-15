@@ -1,6 +1,22 @@
 {
   "apps": [
     {
+      "key": "chrome",
+      "name": "Chromium",
+      "launch": {
+        "type": "exec",
+        "command": "/usr/bin/chromium",
+        "args": [
+          "--no-sandbox",
+          "--disable-dev-shm-usage",
+          "--disable-gpu",
+          "--no-first-run",
+          "--no-default-browser-check",
+          "--window-size=1600,900"
+        ]
+      }
+    },
+    {
       "key": "terminal",
       "name": "Terminal",
       "launch": {

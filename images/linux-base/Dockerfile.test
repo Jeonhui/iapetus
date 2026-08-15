@@ -7,6 +7,7 @@ FROM rust:1-bookworm
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
       xvfb x11-utils x11-apps openbox dbus-x11 \
+      chromium \
       fonts-noto-cjk ibus ibus-hangul \
       sudo ca-certificates \
  && rm -rf /var/lib/apt/lists/*
@@ -22,6 +23,9 @@ RUN cargo test -p iapetusd --features x11 --no-run
 # The L2 launch test needs xclock (x11-apps, already installed) and the
 # catalog, so the image carries the same file the runtime image ships.
 COPY images/linux-base/apps.json /etc/iapetus/apps.json
+# The S1 fixture: a local page, so the scenario proves our input path rather
+# than measuring a search engine's uptime.
+COPY images/linux-base/s1.html /opt/iapetus/s1.html
 COPY images/linux-base/run-l2.sh /usr/local/bin/run-l2.sh
 RUN chmod +x /usr/local/bin/run-l2.sh
 

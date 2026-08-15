@@ -1,0 +1,31 @@
+<meta charset="utf-8">
+<title>S1 READY</title>
+<!--
+  Fixture for the §16 Phase 1 scenario (S1).
+
+  A real search would need the internet, which would make the test slow and
+  flaky and would be measuring Google's availability rather than ours. What S1
+  actually exercises on our side is the chain launch → window → focus → text →
+  key, and that is what this page makes observable: it puts the typed string
+  into the window title, which the guest can read through _NET_WM_NAME without
+  ever comparing pixels (§15.3 forbids that).
+-->
+<style>
+  body { font: 16px sans-serif; margin: 3rem; }
+  input { font-size: 1.5rem; padding: .5rem; width: 20rem; }
+</style>
+<form id="f">
+  <input id="q" autofocus autocomplete="off" placeholder="search">
+</form>
+<p id="out"></p>
+<script>
+  // The title is the assertion surface. It changes only after a real key event
+  // reaches a real focused element, so a test that sees it change has proven
+  // the whole input path rather than that a window merely exists.
+  document.getElementById('f').addEventListener('submit', (e) => {
+    e.preventDefault();
+    const v = document.getElementById('q').value;
+    document.getElementById('out').textContent = 'searched: ' + v;
+    document.title = 'S1 RESULT ' + v;
+  });
+</script>

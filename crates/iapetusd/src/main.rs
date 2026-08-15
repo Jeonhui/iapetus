@@ -38,6 +38,7 @@ fn main() -> ExitCode {
         }
         Some("--supervise-x11") => supervise(),
         Some("--connect") => connect(),
+        Some("--screenshot") => screenshot(args.get(1).map(String::as_str)),
         Some(other) => {
             eprintln!("unknown argument: {other}");
             usage();
@@ -52,9 +53,10 @@ fn main() -> ExitCode {
 
 fn usage() {
     eprintln!(
-        "usage: iapetusd [--connect | --supervise-x11 | --selftest | --version]\n\
+        "usage: iapetusd [--connect | --screenshot FILE | --supervise-x11 | --selftest | --version]\n\
          \n\
          --connect        dial the Control Plane and serve actions (§19.5)\n\
+         --screenshot F   capture the screen through the real pipeline into F (png)\n\
          --supervise-x11  hold the display session open (the container entry point)\n\
          --selftest       exercise the platform layer and report\n\
          --version        print version and supported protocol range"
@@ -108,6 +110,56 @@ fn selftest() -> ExitCode {
         println!("selftest failed: {failures} check(s)");
         ExitCode::FAILURE
     }
+}
+
+/// Captures the screen and writes it out as a PNG.
+///
+/// Not a product feature — the product path is §6.3's stream and §7.5's viewer,
+/// neither of which exists yet. This exists because until they do, there is no
+/// way to look at a Desktop at all, and an operator debugging a guest that
+/// "does nothing" needs to see whether anything is on screen. It goes through
+/// the real capture and encode path rather than calling X directly, so what it
+/// shows is what an agent would have received.
+fn screenshot(path: Option<&str>) -> ExitCode {
+    let Some(path) = path else {
+        eprintln!("--screenshot needs an output path");
+        return ExitCode::from(2);
+    };
+
+    let d = build_dispatcher();
+    let action = iapetus_proto::v1::Action {
+        kind: Some(iapetus_proto::v1::action::Kind::Screenshot(
+            iapetus_proto::v1::ScreenshotRequest {
+                format: iapetus_proto::v1::ImageFormat::Png as i32,
+                quality: 0,
+                region: None,
+                scale: None,
+            },
+        )),
+    };
+
+    let result = match d.execute(&action) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("capture failed: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let Some(iapetus_proto::v1::action_result::Value::Screenshot(shot)) = result.value else {
+        eprintln!("capture returned no screenshot");
+        return ExitCode::FAILURE;
+    };
+    let Some(iapetus_proto::v1::screenshot_response::Payload::Inline(bytes)) = shot.payload else {
+        eprintln!("capture returned no image data");
+        return ExitCode::FAILURE;
+    };
+
+    if let Err(e) = std::fs::write(path, &bytes) {
+        eprintln!("writing {path}: {e}");
+        return ExitCode::FAILURE;
+    }
+    println!("wrote {} ({}x{}, {} bytes)", path, shot.width, shot.height, bytes.len());
+    ExitCode::SUCCESS
 }
 
 /// Reads a required environment variable, naming it plainly when absent.

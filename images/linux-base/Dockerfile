@@ -24,6 +24,7 @@ FROM debian:bookworm-slim
 # test uses to prove capture works against a real X server.
 RUN apt-get update && apt-get install -y --no-install-recommends \
       xvfb x11-utils x11-apps \
+      chromium \
       openbox \
       dbus-x11 \
       fonts-noto-cjk ibus ibus-hangul \
