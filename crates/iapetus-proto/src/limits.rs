@@ -71,6 +71,18 @@ pub const fn lease_ttl_sec(heartbeat_interval_sec: u32) -> u32 {
     heartbeat_interval_sec * LEASE_MISSED_INTERVALS
 }
 
+// Both relations below hold between constants, so they are checked at compile
+// time rather than in a test. A build that never runs the tests still cannot
+// ship a limits module that contradicts itself.
+
+/// §12.4 allows six concurrent observers per host. If the session cap equalled
+/// it, a caller could not tell which of the two limits it had hit.
+const _: () = assert!(SESSIONS_MAX_READ > 6, "session and stream caps must stay distinguishable (§8.2)");
+
+/// §8.2: above the inline cap a presigned URL is mandatory, which is only
+/// meaningful while the inline cap is the smaller of the two.
+const _: () = assert!(UPLOAD_INLINE_MAX_BYTES < UPLOAD_TOTAL_MAX_BYTES);
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -79,22 +91,6 @@ mod tests {
     fn lease_ttl_is_three_heartbeats() {
         assert_eq!(lease_ttl_sec(HEARTBEAT_INTERVAL_DEFAULT_SEC), 90);
         assert_eq!(lease_ttl_sec(10), 30);
-    }
-
-    #[test]
-    fn read_session_cap_exceeds_host_stream_capacity() {
-        // §12.4 allows six concurrent observers per host. If the session cap
-        // equalled it, a caller could not tell which limit it hit.
-        const HOST_CONCURRENT_STREAMS: usize = 6;
-        assert!(
-            SESSIONS_MAX_READ > HOST_CONCURRENT_STREAMS,
-            "session and stream caps must stay distinguishable (§8.2)"
-        );
-    }
-
-    #[test]
-    fn inline_upload_stays_below_the_total_ceiling() {
-        assert!(UPLOAD_INLINE_MAX_BYTES < UPLOAD_TOTAL_MAX_BYTES);
     }
 
     #[test]
