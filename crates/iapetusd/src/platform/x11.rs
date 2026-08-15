@@ -289,9 +289,8 @@ impl X11Input {
             .reply()
             .map_err(input_err("get_keyboard_mapping reply"))?;
 
-        let scratch = Self::find_scratch(&mapping, min_keycode).ok_or_else(|| {
-            PlatformError::Unsupported("no unused keycode available for Unicode typing")
-        })?;
+        let scratch = Self::find_scratch(&mapping, min_keycode)
+            .ok_or(PlatformError::Unsupported("no unused keycode available for Unicode typing"))?;
 
         Ok(Self {
             conn,
@@ -547,42 +546,6 @@ impl Input for X11Input {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn hangul_maps_into_the_unicode_keysym_range() {
-        // U+C548 안 → 0x0100C548. Getting this wrong is how jamo splitting
-        // starts, so it is asserted rather than assumed.
-        assert_eq!(char_keysym('안'), 0x0100_C548);
-        assert_eq!(char_keysym('요'), 0x0100_C694);
-    }
-
-    #[test]
-    fn latin1_maps_directly_without_the_unicode_offset() {
-        assert_eq!(char_keysym('a'), 0x61);
-        assert_eq!(char_keysym('Z'), 0x5A);
-    }
-
-    #[test]
-    fn unknown_key_names_are_rejected_rather_than_ignored() {
-        assert!(named_keysym("enter").is_some());
-        assert!(named_keysym("ctrl").is_some());
-        assert!(named_keysym("nonexistent").is_none());
-    }
-
-    #[test]
-    fn resolve_key_takes_names_and_single_characters_only() {
-        assert_eq!(resolve_key("Enter"), Some(0xFF0D));
-        assert_eq!(resolve_key("c"), Some(0x63));
-        assert_eq!(resolve_key("안"), Some(0x0100_C548));
-        // A multi-character token that is not a known name must fail rather
-        // than silently typing its first letter.
-        assert_eq!(resolve_key("ctrlc"), None);
-    }
-}
-
 // ── Windows ──────────────────────────────────────────────────
 //
 // The window list comes from the same connection as capture on purpose: a
@@ -774,5 +737,41 @@ impl Windows for std::sync::Arc<X11Display> {
     }
     fn wait_for_window(&self, pid: u32, timeout: Duration) -> Result<Option<WindowInfo>> {
         (**self).wait_for_window(pid, timeout)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn hangul_maps_into_the_unicode_keysym_range() {
+        // U+C548 안 → 0x0100C548. Getting this wrong is how jamo splitting
+        // starts, so it is asserted rather than assumed.
+        assert_eq!(char_keysym('안'), 0x0100_C548);
+        assert_eq!(char_keysym('요'), 0x0100_C694);
+    }
+
+    #[test]
+    fn latin1_maps_directly_without_the_unicode_offset() {
+        assert_eq!(char_keysym('a'), 0x61);
+        assert_eq!(char_keysym('Z'), 0x5A);
+    }
+
+    #[test]
+    fn unknown_key_names_are_rejected_rather_than_ignored() {
+        assert!(named_keysym("enter").is_some());
+        assert!(named_keysym("ctrl").is_some());
+        assert!(named_keysym("nonexistent").is_none());
+    }
+
+    #[test]
+    fn resolve_key_takes_names_and_single_characters_only() {
+        assert_eq!(resolve_key("Enter"), Some(0xFF0D));
+        assert_eq!(resolve_key("c"), Some(0x63));
+        assert_eq!(resolve_key("안"), Some(0x0100_C548));
+        // A multi-character token that is not a known name must fail rather
+        // than silently typing its first letter.
+        assert_eq!(resolve_key("ctrlc"), None);
     }
 }
