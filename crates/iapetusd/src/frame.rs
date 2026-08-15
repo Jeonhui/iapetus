@@ -72,6 +72,11 @@ impl FrameSource {
     }
 
     /// Blocks until the screen changes or the timeout elapses.
+    /// The coordinate frame agents compute clicks against (§7.2).
+    pub fn screen_info(&self) -> Result<crate::platform::ScreenInfo> {
+        self.display.screen_info()
+    }
+
     pub fn wait_for_change(&self, timeout: Duration) -> Result<bool> {
         self.display.wait_for_change(timeout)
     }

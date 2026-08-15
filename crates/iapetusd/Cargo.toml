@@ -10,9 +10,16 @@ repository.workspace = true
 [dependencies]
 iapetus-proto = { path = "../iapetus-proto" }
 thiserror.workspace = true
+prost-types.workspace = true
+tonic = { workspace = true, features = ["tls"] }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time", "sync", "signal"] }
+tokio-stream.workspace = true
 # Pure Rust: speaks the X protocol over a socket, so the container needs no
 # libx11-dev and cross-compilation stays simple.
 x11rb = { workspace = true, optional = true, features = ["xtest", "damage"] }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time", "sync", "test-util"] }
 
 [features]
 default = []

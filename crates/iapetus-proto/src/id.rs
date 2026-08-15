@@ -61,13 +61,17 @@ id_kinds! {
 /// Every prefix is exactly three characters, which makes every identifier
 /// exactly 30 characters (§8.2). That uniformity buys fixed-width database
 /// columns, aligned log output, and a parser that can slice at a constant
-/// offset. `PREFIX_LEN` is asserted against the registry in the tests.
-const PREFIX_LEN: usize = 3;
+/// offset. It is asserted against the registry in the tests, so the constant
+/// and the table cannot drift apart.
+pub const PREFIX_LEN: usize = 3;
 
 /// Crockford Base32 excludes I, L, O, and U so they cannot be confused with
 /// 1, 0, and V when a human reads an id out of a log.
 const CROCKFORD: &[u8] = b"0123456789ABCDEFGHJKMNPQRSTVWXYZ";
-const ULID_LEN: usize = 26;
+pub const ULID_LEN: usize = 26;
+
+/// Every identifier is `PREFIX_LEN + 1 + ULID_LEN` characters (§8.2).
+pub const ID_LEN: usize = PREFIX_LEN + 1 + ULID_LEN;
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum IdError {

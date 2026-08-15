@@ -26,7 +26,6 @@ use x11rb::protocol::xproto::{
 };
 use x11rb::protocol::Event;
 use x11rb::rust_connection::RustConnection;
-use x11rb::wrapper::ConnectionExt as _;
 use x11rb::COPY_DEPTH_FROM_PARENT;
 
 /// Skips the test when no X server is reachable, so the suite passes on hosts
@@ -47,8 +46,6 @@ macro_rules! require_x11 {
 struct TestWindow {
     conn: RustConnection,
     win: u32,
-    x: i16,
-    y: i16,
 }
 
 impl TestWindow {
@@ -102,7 +99,7 @@ impl TestWindow {
         .expect("set_input_focus");
         conn.flush().expect("flush");
 
-        Self { conn, win, x, y }
+        Self { conn, win }
     }
 
     /// Collects events for up to `timeout`, returning those that arrive.

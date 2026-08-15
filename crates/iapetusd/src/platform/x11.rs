@@ -23,6 +23,7 @@ use x11rb::protocol::xproto::{
 use x11rb::protocol::xtest::ConnectionExt as _;
 use x11rb::protocol::Event;
 use x11rb::rust_connection::RustConnection;
+use x11rb::wrapper::ConnectionExt as _;
 
 use super::{Button, Display, Frame, Input, PlatformError, Rect, Result, ScreenInfo};
 
@@ -377,7 +378,12 @@ impl X11Input {
             self.conn
                 .change_keyboard_mapping(1, self.scratch, per as u8, &vec![0u32; per])
                 .map_err(input_err("restore keyboard mapping"))?;
-            self.conn.flush().map_err(input_err("flush"))?;
+            // A round trip, not a flush. `flush` only pushes the bytes onto the
+            // socket; it says nothing about the server having processed them, so
+            // the call could return with the scratch keycode still bound. §5.6
+            // hands the lease over the moment an action completes, and the human
+            // who takes it would find one key typing the agent's last syllable.
+            self.conn.sync().map_err(input_err("sync after restoring the mapping"))?;
         }
         Ok(())
     }
@@ -440,7 +446,7 @@ impl Input for X11Input {
     }
 
     fn scroll(&self, dx: i32, dy: i32) -> Result<()> {
-        let mut step = |btn: u8, n: i32| -> Result<()> {
+        let step = |btn: u8, n: i32| -> Result<()> {
             for _ in 0..n.abs() {
                 self.fake(BUTTON_PRESS, btn, 0, 0)?;
                 self.fake(BUTTON_RELEASE, btn, 0, 0)?;

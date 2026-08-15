@@ -99,6 +99,10 @@ pub struct FakeInput {
     held_keys: Mutex<Vec<String>>,
     held_buttons: Mutex<Vec<Button>>,
     screen: Option<(u32, u32)>,
+    /// Makes every call take measurable time, so rules that only appear under
+    /// slow execution — the §19.5 deadline, queue backpressure — can be tested
+    /// without guessing at real driver latency.
+    latency: Option<Duration>,
 }
 
 impl FakeInput {
@@ -139,7 +143,17 @@ impl FakeInput {
         Ok(())
     }
 
+    /// Makes every call block for `d`.
+    #[must_use]
+    pub fn with_latency(mut self, d: Duration) -> Self {
+        self.latency = Some(d);
+        self
+    }
+
     fn push(&self, e: InputEvent) {
+        if let Some(d) = self.latency {
+            std::thread::sleep(d);
+        }
         self.events.lock().unwrap().push(e);
     }
 }
@@ -206,6 +220,41 @@ impl Input for FakeInput {
             self.push(InputEvent::ButtonUp(b));
         }
         Ok(())
+    }
+}
+
+/// Lets a test keep a handle for assertions while the Dispatcher owns the
+/// driver. The Display side has the same forwarding impl for the same reason.
+impl Input for std::sync::Arc<FakeInput> {
+    fn move_to(&self, x: i32, y: i32) -> Result<()> {
+        (**self).move_to(x, y)
+    }
+    fn click(&self, x: i32, y: i32, button: Button, count: u8) -> Result<()> {
+        (**self).click(x, y, button, count)
+    }
+    fn button_down(&self, button: Button) -> Result<()> {
+        (**self).button_down(button)
+    }
+    fn button_up(&self, button: Button) -> Result<()> {
+        (**self).button_up(button)
+    }
+    fn scroll(&self, dx: i32, dy: i32) -> Result<()> {
+        (**self).scroll(dx, dy)
+    }
+    fn type_text(&self, text: &str, delay: Duration) -> Result<()> {
+        (**self).type_text(text, delay)
+    }
+    fn key(&self, combo: &str) -> Result<()> {
+        (**self).key(combo)
+    }
+    fn key_down(&self, key: &str) -> Result<()> {
+        (**self).key_down(key)
+    }
+    fn key_up(&self, key: &str) -> Result<()> {
+        (**self).key_up(key)
+    }
+    fn release_all(&self) -> Result<()> {
+        (**self).release_all()
     }
 }
 

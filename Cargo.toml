@@ -17,6 +17,8 @@ tonic-build = "0.12"
 prost-build = "0.13"
 protoc-bin-vendored = "3"
 thiserror = "2"
+tokio = { version = "1", default-features = false }
+tokio-stream = "0.1"
 x11rb = { version = "0.13", default-features = false }
 
 [profile.release]
