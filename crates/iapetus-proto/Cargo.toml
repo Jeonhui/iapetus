@@ -15,6 +15,7 @@ tonic = { workspace = true, optional = true }
 
 [build-dependencies]
 tonic-build.workspace = true
+protoc-bin-vendored.workspace = true
 
 [features]
 # The daemon channel (PRD §19.5) is gRPC. Consumers that only need the message

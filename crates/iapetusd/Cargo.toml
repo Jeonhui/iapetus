@@ -1,0 +1,18 @@
+[package]
+name = "iapetusd"
+description = "The Iapetus guest daemon: capture, input, and the Control Plane channel"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+iapetus-proto = { path = "../iapetus-proto" }
+thiserror.workspace = true
+
+[features]
+default = []
+# The real X11 backend. Off by default so the crate builds and tests on any
+# host; CI enables it inside the Linux container (§15.1 L2).
+x11 = []

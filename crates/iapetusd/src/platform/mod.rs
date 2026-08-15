@@ -1,0 +1,120 @@
+//! Platform abstraction for capture and input (PRD §19.1).
+//!
+//! The Computer API is OS-agnostic (§6.2); these two traits are where that
+//! promise is kept. Everything above them — the Frame Source, the daemon
+//! stream, the action dispatcher — is written once and compiled for both.
+//!
+//! Unsafe FFI is confined to the implementations behind these traits. X11
+//! (XTEST), DXGI, and SendInput are all unsafe; nothing above this module is.
+
+use std::time::{Duration, SystemTime};
+
+pub mod fake;
+
+#[cfg(all(target_os = "linux", feature = "x11"))]
+pub mod x11;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Button {
+    Left,
+    Right,
+    Middle,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Rect {
+    pub x: i32,
+    pub y: i32,
+    pub width: u32,
+    pub height: u32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ScreenInfo {
+    pub width: u32,
+    pub height: u32,
+    pub dpi: u32,
+    /// PRD §7.2 fixes v1 at a single monitor. The field exists so multi-monitor
+    /// support in v2 does not change the shape of every response.
+    pub monitor_count: u32,
+}
+
+/// One captured frame.
+///
+/// `captured_at` is what makes the §6.3 freshness contract checkable: a caller
+/// can prove the frame postdates the action it followed.
+#[derive(Debug, Clone)]
+pub struct Frame {
+    pub width: u32,
+    pub height: u32,
+    /// Tightly packed RGBA, `width * height * 4` bytes.
+    pub pixels: Vec<u8>,
+    pub captured_at: SystemTime,
+}
+
+impl Frame {
+    #[must_use]
+    pub fn byte_len(&self) -> usize {
+        (self.width as usize) * (self.height as usize) * 4
+    }
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum PlatformError {
+    #[error("display unavailable: {0}")]
+    DisplayUnavailable(String),
+    #[error("capture failed: {0}")]
+    CaptureFailed(String),
+    #[error("input rejected: {0}")]
+    InputRejected(String),
+    #[error("coordinate ({x}, {y}) is outside the {width}x{height} screen")]
+    OutOfBounds { x: i32, y: i32, width: u32, height: u32 },
+    #[error("not supported on this platform: {0}")]
+    Unsupported(&'static str),
+}
+
+pub type Result<T> = std::result::Result<T, PlatformError>;
+
+/// Screen capture.
+pub trait Display: Send + Sync {
+    /// Captures the screen, or a region of it, right now.
+    ///
+    /// Implementations must stamp `captured_at` at the moment the pixels are
+    /// read, not when the call was made — the difference is exactly what the
+    /// freshness contract measures.
+    fn capture(&self, region: Option<Rect>) -> Result<Frame>;
+
+    fn screen_info(&self) -> Result<ScreenInfo>;
+
+    /// Blocks until the screen changes or the timeout elapses.
+    ///
+    /// Backed by XDamage on X11 and by DXGI's own change notification on
+    /// Windows. Returning `false` on timeout is what lets the Frame Source idle
+    /// at zero CPU while nothing moves (§6.3).
+    fn wait_for_change(&self, timeout: Duration) -> Result<bool>;
+}
+
+/// Keyboard and pointer input.
+pub trait Input: Send + Sync {
+    fn move_to(&self, x: i32, y: i32) -> Result<()>;
+    fn click(&self, x: i32, y: i32, button: Button, count: u8) -> Result<()>;
+    fn button_down(&self, button: Button) -> Result<()>;
+    fn button_up(&self, button: Button) -> Result<()>;
+    fn scroll(&self, dx: i32, dy: i32) -> Result<()>;
+
+    /// Types text. `text` arrives already NFC-normalized (§8.2); implementations
+    /// must not normalize again, and must go through the IME rather than
+    /// synthesizing keycodes, or Hangul jamo split (§15.2).
+    fn type_text(&self, text: &str, delay: Duration) -> Result<()>;
+
+    fn key(&self, combo: &str) -> Result<()>;
+    fn key_down(&self, key: &str) -> Result<()>;
+    fn key_up(&self, key: &str) -> Result<()>;
+
+    /// Releases every held key and pointer button.
+    ///
+    /// Called immediately before a control lease changes hands (§5.6). Without
+    /// it, an agent preempted after `key.down ctrl` leaves Ctrl latched and
+    /// every subsequent keystroke by the human is read as a shortcut.
+    fn release_all(&self) -> Result<()>;
+}
