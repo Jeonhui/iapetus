@@ -1,0 +1,50 @@
+# Iapetus — a persistent virtual desktop for AI agents.
+#
+#   docker compose up --build
+#   open http://localhost:8080/?token=dev-write
+#
+# Three services on one image:
+#   controlplane  issues and verifies tokens (§8.1)
+#   gateway       relays the desktop's screen to the browser, and input back (§6.1)
+#   desktop       one virtual Desktop: an X session with a browser, streamed (§5.3)
+#
+# This is the development wiring: the gateway trusts the shared secrets `dev`
+# (view) and `dev-write` (operate). To run real §8.1 JWTs instead, set
+# IAPETUS_JWKS on the gateway to the line the control plane prints at startup.
+
+name: iapetus
+
+services:
+  controlplane:
+    build:
+      context: .
+      dockerfile: images/linux-base/Dockerfile
+    image: iapetus:dev
+    command: iapetus-controlplane
+    environment:
+      IAPETUS_CP_BIND: 0.0.0.0:8090
+      IAPETUS_PROJECT_KEY: sk_iap_live_demo
+    ports:
+      - "8090:8090"
+
+  gateway:
+    image: iapetus:dev
+    command: iapetus-gateway
+    environment:
+      IAPETUS_GATEWAY_BIND: 0.0.0.0:8080
+    ports:
+      - "8080:8080"
+    depends_on:
+      - controlplane
+
+  desktop:
+    image: iapetus:dev
+    command: /usr/local/bin/compose-desktop.sh
+    environment:
+      DISPLAY: ":1"
+      SCREEN_GEOMETRY: 1920x1080x24
+      IAPETUS_GATEWAY_INGEST: ws://gateway:8080/ingest?token=dev
+    # /dev/shm defaults to 64MB in Docker, which Chromium's renderer crashes on.
+    shm_size: 512m
+    depends_on:
+      - gateway

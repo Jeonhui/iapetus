@@ -13,7 +13,9 @@ FROM rust:1-bookworm AS builder
 WORKDIR /src
 COPY Cargo.toml Cargo.lock ./
 COPY crates/ ./crates/
-RUN cargo build --release -p iapetusd
+# All three service binaries from one build, so the compose stack runs on a
+# single image and a developer builds once. iapetusd needs the x11 backend.
+RUN cargo build --release       -p iapetusd --features iapetusd/x11       -p iapetus-gateway       -p iapetus-controlplane
 
 FROM debian:bookworm-slim
 
@@ -39,15 +41,21 @@ RUN useradd -m -s /bin/bash iapetus \
  && chmod 0440 /etc/sudoers.d/iapetus
 
 COPY --from=builder /src/target/release/iapetusd /usr/local/bin/iapetusd
+COPY --from=builder /src/target/release/iapetus-gateway /usr/local/bin/iapetus-gateway
+COPY --from=builder /src/target/release/iapetus-controlplane /usr/local/bin/iapetus-controlplane
 # §5.5: shortcuts for the programs this image ships. Not a restriction —
 # anything on the disk still launches by path under OWNER mode (§7.3).
 COPY images/linux-base/apps.json /etc/iapetus/apps.json
+COPY images/linux-base/s1.html /opt/iapetus/s1.html
+COPY images/linux-base/compose-desktop.sh /usr/local/bin/compose-desktop.sh
 COPY images/linux-base/entrypoint.sh /usr/local/bin/entrypoint.sh
-RUN chmod +x /usr/local/bin/entrypoint.sh
+RUN chmod +x /usr/local/bin/entrypoint.sh /usr/local/bin/compose-desktop.sh
 
 ENV DISPLAY=:1 \
     SCREEN_GEOMETRY=1920x1080x24
 
 USER iapetus
 WORKDIR /home/iapetus
-ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]
+# No ENTRYPOINT: docker-compose gives each service its command. The desktop
+# service runs compose-desktop.sh; the gateway and control plane run their
+# binaries directly.
