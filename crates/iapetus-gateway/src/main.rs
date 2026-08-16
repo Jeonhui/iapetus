@@ -733,23 +733,25 @@ impl App {
     /// still decides whether input passes (§7.5). Without a JWKS it falls back
     /// to the development shared secrets.
     fn control_for(&self, token: Option<&str>) -> Option<Control> {
-        if let Some(jwks) = &self.jwks {
-            let policy = Policy {
-                audience: AUDIENCE,
-                lifetime_cap_sec: Some(8 * 3600), // viewer cap (§8.1)
-            };
-            let claims = iapetus_auth::verify(token?, jwks, &policy, now_epoch()).ok()?;
-            return Some(if claims.has_scope("desktop:control") {
-                Control::Write
-            } else {
-                Control::Read
-            });
-        }
+        // The development shared secrets are accepted first, so `?token=dev-write`
+        // works with no key material. A real §8.1 JWT is then tried against the
+        // JWKS if one is configured, so a token the control plane signed — what
+        // the SDK and the parent-app demo mint — works too. Accepting both is a
+        // development convenience; a production gateway sets a JWKS and issues no
+        // shared secrets, so only signed tokens pass.
         match token {
-            Some(t) if t == self.write_token => Some(Control::Write),
-            Some(t) if t == self.view_token => Some(Control::Read),
-            _ => None,
+            Some(t) if t == self.write_token => return Some(Control::Write),
+            Some(t) if t == self.view_token => return Some(Control::Read),
+            _ => {}
         }
+        let jwks = self.jwks.as_ref()?;
+        let policy = Policy { audience: AUDIENCE, lifetime_cap_sec: Some(8 * 3600) };
+        let claims = iapetus_auth::verify(token?, jwks, &policy, now_epoch()).ok()?;
+        Some(if claims.has_scope("desktop:control") {
+            Control::Write
+        } else {
+            Control::Read
+        })
     }
 
     /// Whether a guest token authorizes the §19.5 stream.
@@ -758,11 +760,15 @@ impl App {
     /// checking the audience is what stops a Viewer or Agent token from being
     /// replayed to push a screen.
     fn ingest_ok(&self, token: Option<&str>) -> bool {
-        if let Some(jwks) = &self.jwks {
-            let policy = Policy { audience: AUDIENCE_GUEST, lifetime_cap_sec: None };
-            return token.is_some_and(|t| iapetus_auth::verify(t, jwks, &policy, now_epoch()).is_ok());
+        // The guest registers with the ingest secret (§19.6's SRTP key stands
+        // in as this), and where a JWKS is configured a real Guest Token is
+        // also accepted — so a dev desktop and a production one both attach.
+        if token == Some(self.ingest_token.as_str()) {
+            return true;
         }
-        token == Some(self.ingest_token.as_str())
+        let Some(jwks) = &self.jwks else { return false };
+        let policy = Policy { audience: AUDIENCE_GUEST, lifetime_cap_sec: None };
+        token.is_some_and(|t| iapetus_auth::verify(t, jwks, &policy, now_epoch()).is_ok())
     }
 }
 

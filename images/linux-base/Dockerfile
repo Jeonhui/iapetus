@@ -25,7 +25,8 @@ FROM debian:bookworm-slim
 # x11-utils and x11-apps provide xdpyinfo and xwd, which the L2 integration
 # test uses to prove capture works against a real X server.
 RUN apt-get update && apt-get install -y --no-install-recommends \
-      xvfb x11-utils x11-apps \
+      xvfb x11-utils x11-apps x11-xserver-utils \
+      tint2 pcmanfm xterm \
       chromium \
       openbox \
       dbus-x11 \

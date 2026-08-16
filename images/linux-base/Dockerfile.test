@@ -6,7 +6,7 @@
 FROM rust:1-bookworm
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
-      xvfb x11-utils x11-apps openbox dbus-x11 \
+      xvfb x11-utils x11-apps x11-xserver-utils openbox dbus-x11 \
       chromium \
       fonts-noto-cjk ibus ibus-hangul \
       sudo ca-certificates \

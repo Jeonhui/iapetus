@@ -78,15 +78,39 @@ let tilesApplied = 0, bytes = 0, lastSeq = -1;
 // address rather than a resource the page has to go fetch.
 const token = new URLSearchParams(location.search).get('token') || '';
 const proto = location.protocol === 'https:' ? 'wss' : 'ws';
-const ws = new WebSocket(`${proto}://${location.host}/view?token=${encodeURIComponent(token)}`);
-ws.binaryType = 'arraybuffer';
 
-ws.onopen = () => statEl.textContent = 'connected';
-ws.onclose = (ev) => {
-  // 1008/1006 right after connecting is almost always a rejected token, and
-  // "disconnected" would send the user looking at their network instead.
-  statEl.textContent = tilesApplied === 0 ? 'refused — check the viewer token' : 'disconnected';
-};
+// The socket is reconnected on drop, so a viewer opened before the desktop has
+// attached — or a momentary network blip — recovers on its own rather than
+// freezing on an error. Only a token that never yields a frame after several
+// tries is reported as refused; a blip or a not-yet-ready desktop is not.
+let ws = null;
+let everHadFrame = false;
+let reconnectAttempts = 0;
+
+function connect() {
+  ws = new WebSocket(`${proto}://${location.host}/view?token=${encodeURIComponent(token)}`);
+  ws.binaryType = 'arraybuffer';
+  ws.onopen = () => {
+    reconnectAttempts = 0;
+    statEl.textContent = everHadFrame ? 'connected' : 'connected — waiting for the screen';
+    // Ask for a fresh frame on (re)connect, so a reconnected viewer is not
+    // left on a blank canvas until something on screen happens to move.
+    send({ type: 'keyframe' });
+  };
+  ws.onmessage = handleMessage;
+  ws.onclose = () => {
+    reconnectAttempts++;
+    // A socket that opens and closes without ever delivering a frame, several
+    // times over, is a token the gateway keeps refusing — the one case worth
+    // telling the user about. Everything else is transient, so reconnect.
+    if (!everHadFrame && reconnectAttempts >= 4) {
+      statEl.textContent = 'refused — check the viewer token';
+      return;
+    }
+    statEl.textContent = 'reconnecting…';
+    setTimeout(connect, Math.min(500 * reconnectAttempts, 4000));
+  };
+}
 // This viewer's own lease session, learned when it acquires. The gateway names
 // the holder by session, so this is how the tab tells "I am operating" from
 // "someone else is".
@@ -127,7 +151,7 @@ function renderLease(holder, session) {
   }
 }
 
-ws.onmessage = async (ev) => {
+async function handleMessage(ev) {
   if (typeof ev.data === 'string') {
     const m = JSON.parse(ev.data);
     if (m.type === 'lagged') { send({ type: 'keyframe' }); return; }
@@ -147,8 +171,11 @@ ws.onmessage = async (ev) => {
     }
     return;
   }
+  everHadFrame = true;
   await applyUpdate(new DataView(ev.data));
-};
+}
+
+connect();
 
 // The gateway does not tell us our own session id, so we learn it the moment an
 // acquire succeeds: the next control message naming a human holder that was not
@@ -197,7 +224,7 @@ function fitCanvas() {
 }
 
 function send(msg) {
-  if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(msg));
+  if (ws && ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(msg));
 }
 
 // ── Coordinates ────────────────────────────────────────────
