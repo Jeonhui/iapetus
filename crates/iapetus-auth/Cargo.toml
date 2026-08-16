@@ -1,0 +1,20 @@
+[package]
+name = "iapetus-auth"
+description = "Token signing and verification (PRD §8.1): Ed25519 JWTs, JWKS, scopes"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+# Ed25519 chosen over RS256 (§8.1): fast, short keys, no RSA padding traps.
+ed25519-dalek = { version = "2", default-features = false, features = ["std"] }
+base64 = "0.22"
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+# A deterministic signing key for tests, so no RNG is needed at test time.
+ed25519-dalek = { version = "2", default-features = false, features = ["std"] }
