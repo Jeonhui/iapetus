@@ -71,3 +71,4 @@ secrets.yaml
 !.vscode/extensions.json
 *.swp
 *~
+sdk/typescript/package-lock.json
