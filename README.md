@@ -32,6 +32,22 @@ Open the same URL in a second tab with `?token=dev` (read-only) to watch without
 being able to operate, and press **Take control** in a `dev-write` tab to see the
 lease change hands.
 
+### Drive it from Python
+
+```python
+from iapetus import Iapetus                       # pip install ./sdk/python
+
+client = Iapetus(api_key="sk_iap_live_demo")
+print(client.viewer_url("dsk_1", user_id="you"))  # a URL a person opens to watch
+
+with client.session("dsk_1", gateway_token="dev-write") as c:
+    c.type("hello from the SDK")
+    c.key("Enter")
+    png = c.screenshot()                          # PNG bytes of the live screen
+```
+
+See [`sdk/python`](sdk/python) for the full surface.
+
 The control plane is at <http://localhost:8090>. Mint a real token against it:
 
 ```bash
@@ -137,7 +153,7 @@ Not yet built:
 - Desktop provisioning (Firecracker microVMs) and the scheduler (§12.4, §19.2)
 - The WebRTC media path — the default; today's stream is the §6.3 fallback
 - The rest of the REST API: desktops, policy, webhooks, event stream (§8.4)
-- Python and TypeScript SDKs (§8.6)
+- The TypeScript SDK (§8.6) — the Python SDK is in [`sdk/python`](sdk/python)
 
 ## License
 

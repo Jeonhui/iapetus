@@ -38,6 +38,17 @@ enum ViewerInput {
     Type { text: String },
     #[serde(rename = "key")]
     Key { keys: String },
+    #[serde(rename = "screenshot")]
+    Screenshot,
+    #[serde(rename = "app.launch")]
+    AppLaunch {
+        #[serde(default)]
+        key: Option<String>,
+        #[serde(default)]
+        command: Option<String>,
+        #[serde(default)]
+        wait_for_window: bool,
+    },
     /// A viewer joined, or lost its place in the stream, and needs a full frame.
     #[serde(rename = "keyframe")]
     Keyframe,
@@ -74,9 +85,66 @@ fn to_action(input: ViewerInput) -> Option<v1::Action> {
         // arrive as jamo).
         ViewerInput::Type { text } => Kind::TypeText(v1::TypeText { text, delay_ms: None }),
         ViewerInput::Key { keys } => Kind::Key(v1::KeyPress { keys, count: Some(1) }),
+        ViewerInput::Screenshot => Kind::Screenshot(v1::ScreenshotRequest {
+            format: v1::ImageFormat::Png as i32,
+            quality: 0,
+            region: None,
+            scale: None,
+        }),
+        ViewerInput::AppLaunch { key, command, wait_for_window } => {
+            let target = match (key, command) {
+                (Some(k), _) => Some(v1::app_launch::Target::Key(k)),
+                (_, Some(c)) => Some(v1::app_launch::Target::Command(c)),
+                _ => return None,
+            };
+            Kind::AppLaunch(v1::AppLaunch {
+                target,
+                args: vec![],
+                cwd: None,
+                elevated: None,
+                wait_for_window: Some(wait_for_window),
+            })
+        }
         ViewerInput::Keyframe | ViewerInput::ReleaseAll => return None,
     };
     Some(v1::Action { kind: Some(kind) })
+}
+
+/// Serializes an action result for the agent, screenshot bytes included.
+fn result_to_json(id: u64, r: &iapetus_proto::v1::ActionResult) -> String {
+    use base64::Engine;
+    use iapetus_proto::v1::action_result::Value;
+    let b64 = base64::engine::general_purpose::STANDARD;
+
+    let mut obj = serde_json::json!({ "type": "result", "id": id, "ok": r.ok });
+    if let Some(e) = &r.error {
+        obj["error"] = serde_json::json!(e.code);
+        obj["message"] = serde_json::json!(e.message);
+    }
+    match &r.value {
+        Some(Value::Screenshot(s)) => {
+            if let Some(iapetus_proto::v1::screenshot_response::Payload::Inline(bytes)) = &s.payload {
+                // Base64 rather than raw: the result rides a JSON text frame, so
+                // the image has to survive as text. The SDK decodes it back.
+                obj["screenshot"] = serde_json::json!(b64.encode(bytes));
+                obj["width"] = serde_json::json!(s.width);
+                obj["height"] = serde_json::json!(s.height);
+            }
+        }
+        Some(Value::AppLaunch(a)) => {
+            obj["pid"] = serde_json::json!(a.pid);
+            if let Some(win) = &a.window {
+                obj["window"] = serde_json::json!({ "id": win.id, "title": win.title });
+            }
+        }
+        _ => {}
+    }
+    obj.to_string()
+}
+
+fn error_result(id: u64, code: &str, message: &str) -> String {
+    serde_json::json!({ "type": "result", "id": id, "ok": false, "error": code, "message": message })
+        .to_string()
 }
 
 /// Runs the viewer link until the socket closes.
@@ -93,17 +161,31 @@ pub async fn run(
     let (mut tx, mut rx) = socket.split();
 
     let (kf_tx, mut kf_rx) = tokio::sync::mpsc::channel::<()>(8);
+    // Action results flow back to the gateway on the same socket as screen
+    // updates: a viewer's input needs no reply, but an agent's action does, and
+    // this is the channel that carries it.
+    let (resp_tx, mut resp_rx) = tokio::sync::mpsc::channel::<String>(64);
 
-    // ── Input, viewer → guest ────────────────────────────────
+    // ── Input and actions, gateway → guest ───────────────────
     let input_task = {
         let d = Arc::clone(&dispatcher);
         tokio::spawn(async move {
             while let Some(Ok(msg)) = rx.next().await {
                 let Message::Text(t) = msg else { continue };
+                // An `id` marks an agent action that expects a reply; a viewer's
+                // input has none. Pulled out before the typed parse so the same
+                // message shape serves both.
+                let id = serde_json::from_str::<serde_json::Value>(&t)
+                    .ok()
+                    .and_then(|v| v.get("id").and_then(serde_json::Value::as_u64));
+
                 let Ok(parsed) = serde_json::from_str::<ViewerInput>(&t) else {
-                    // A message we do not understand is dropped rather than
-                    // guessed at: guessing turns a viewer bug into input the
-                    // person never asked for, on a desktop they own.
+                    // Unclassifiable input is dropped rather than guessed at. But
+                    // an agent that sent an id is owed an answer, or its SDK
+                    // hangs waiting for one.
+                    if let Some(id) = id {
+                        let _ = resp_tx.send(error_result(id, "BAD_REQUEST", "unparseable action")).await;
+                    }
                     continue;
                 };
                 if matches!(parsed, ViewerInput::Keyframe) {
@@ -111,17 +193,27 @@ pub async fn run(
                     continue;
                 }
                 if matches!(parsed, ViewerInput::ReleaseAll) {
-                    // §5.6 handover: release everything the previous holder left
-                    // down. Runs on the blocking pool because the driver is
-                    // blocking, like every other action.
                     let d = Arc::clone(&d);
                     let _ = tokio::task::spawn_blocking(move || d.release_all()).await;
                     continue;
                 }
-                let Some(action) = to_action(parsed) else { continue };
-                // Blocking drivers, so off the runtime thread.
+                let Some(action) = to_action(parsed) else {
+                    if let Some(id) = id {
+                        let _ = resp_tx.send(error_result(id, "EXEC_FAILED", "empty action")).await;
+                    }
+                    continue;
+                };
+
                 let d2 = Arc::clone(&d);
-                let _ = tokio::task::spawn_blocking(move || d2.execute_reported(&action)).await;
+                let result = tokio::task::spawn_blocking(move || d2.execute_reported(&action))
+                    .await
+                    .unwrap_or_else(|e| crate::dispatch::panic_result(&e.to_string()));
+
+                // Reply only when asked. A viewer click gets no packet back; an
+                // agent action gets its result, screenshot bytes and all.
+                if let Some(id) = id {
+                    let _ = resp_tx.send(result_to_json(id, &result)).await;
+                }
             }
         })
     };
@@ -190,6 +282,14 @@ pub async fn run(
             && tx.send(Message::Binary(update.to_bytes())).await.is_err()
         {
             break;
+        }
+
+        // Drain any action results waiting to go back, on the same socket. Text
+        // frames and binary frames coexist; the gateway tells them apart.
+        while let Ok(reply) = resp_rx.try_recv() {
+            if tx.send(Message::Text(reply)).await.is_err() {
+                return Ok(());
+            }
         }
 
         // The pacing wait happens at the top of the loop, where it can double as

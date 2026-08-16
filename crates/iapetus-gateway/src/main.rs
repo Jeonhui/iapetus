@@ -25,7 +25,7 @@ use std::time::{Duration, Instant};
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::State;
 use axum::response::{Html, IntoResponse};
-use axum::routing::get;
+use axum::routing::{get, post};
 use axum::Router;
 use iapetus_auth::{Jwks, Policy, AUDIENCE, AUDIENCE_GUEST};
 use iapetus_proto::lease::{Acquired, Actor, ControlLease};
@@ -176,6 +176,12 @@ struct App {
     started: Instant,
     /// Hands each viewer socket a distinct lease session id.
     next_session: AtomicU64,
+    /// Agent actions awaiting a reply from the guest, keyed by the id the
+    /// gateway assigned. §8.5's request/response over one connection: the guest
+    /// answers on the same socket it streams on, and this matches the answer to
+    /// the waiting HTTP request.
+    pending: std::sync::Mutex<std::collections::HashMap<u64, tokio::sync::oneshot::Sender<String>>>,
+    next_action: AtomicU64,
     /// Stands in for §19.6's SRTP key: the guest proves it belongs before it may
     /// push a screen. Not the product mechanism, but the endpoint must not be
     /// open to anything that can reach the port.
@@ -239,6 +245,8 @@ async fn main() {
         control_events,
         started: Instant::now(),
         next_session: AtomicU64::new(1),
+        pending: std::sync::Mutex::new(std::collections::HashMap::new()),
+        next_action: AtomicU64::new(1),
         guest_attached: std::sync::atomic::AtomicBool::new(false),
         ingest_token,
         view_token,
@@ -264,6 +272,7 @@ async fn main() {
         .route("/", get(|| async { Html(include_str!("viewer.html")) }))
         .route("/view", get(view_ws))
         .route("/ingest", get(ingest_ws))
+        .route("/v1/action", post(action))
         .with_state(app);
 
     let listener = tokio::net::TcpListener::bind(&bind).await.expect("bind");
@@ -312,12 +321,28 @@ async fn guest_socket(socket: WebSocket, app: Arc<App>) {
     });
 
     while let Some(Ok(msg)) = rx.next().await {
-        if let Message::Binary(buf) = msg {
-            app.cache.lock().await.apply(&buf);
-            // A send with no receivers is not an error: nobody is watching, and
-            // the guest should keep streaming so the cache stays warm for
-            // whoever opens a tab next.
-            let _ = app.frames.send(Arc::new(buf.to_vec()));
+        match msg {
+            Message::Binary(buf) => {
+                app.cache.lock().await.apply(&buf);
+                // A send with no receivers is not an error: nobody is watching,
+                // and the guest should keep streaming so the cache stays warm
+                // for whoever opens a tab next.
+                let _ = app.frames.send(Arc::new(buf.to_vec()));
+            }
+            // An action result: match it to the waiting request by its id and
+            // hand it back. A result for an id nobody is waiting on (the request
+            // timed out and gave up) is simply dropped.
+            Message::Text(t) => {
+                if let Some(id) = serde_json::from_str::<serde_json::Value>(&t)
+                    .ok()
+                    .and_then(|v| v.get("id").and_then(serde_json::Value::as_u64))
+                {
+                    if let Some(waiter) = app.pending.lock().unwrap().remove(&id) {
+                        let _ = waiter.send(t.to_string());
+                    }
+                }
+            }
+            _ => {}
         }
     }
 
@@ -505,6 +530,68 @@ fn control_snapshot(app: &App, _session: &str) -> String {
     format!(r#"{{"type":"control","holder":"{kind}","session":"{session}"}}"#)
 }
 
+/// How long an agent action waits for the guest before giving up. Past this the
+/// caller gets a timeout, and a late result is dropped when it arrives — the
+/// §8.5/§19.5 rule that an action past its deadline is not answered twice.
+const ACTION_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// An agent action, forwarded to the guest, its result awaited and returned.
+///
+/// §8.5: requests on one connection execute in arrival order, and the guest
+/// answers on the same socket it streams on. The gateway assigns the id, sends
+/// the action down `to_guest`, and parks on a oneshot until the guest's reply
+/// comes back through `guest_socket`.
+///
+/// Auth reuses the viewer token: an agent driving through this path holds a
+/// WRITE-capable token exactly as an operating human does, and the same control
+/// level gate applies.
+async fn action(
+    State(app): State<Arc<App>>,
+    axum::extract::Query(q): axum::extract::Query<std::collections::HashMap<String, String>>,
+    body: String,
+) -> impl IntoResponse {
+    let level = match app.control_for(q.get("token").map(String::as_str)) {
+        Some(l) => l,
+        None => return (axum::http::StatusCode::UNAUTHORIZED, "bad token").into_response(),
+    };
+    if level != Control::Write {
+        return (axum::http::StatusCode::FORBIDDEN, "a read-only token cannot act").into_response();
+    }
+
+    // The agent sends the bare action JSON; the gateway stamps the id it will
+    // match the reply on, so two in-flight actions cannot be confused.
+    let id = app.next_action.fetch_add(1, Ordering::SeqCst);
+    let stamped = match serde_json::from_str::<serde_json::Value>(&body) {
+        Ok(mut v) => {
+            v["id"] = serde_json::json!(id);
+            v.to_string()
+        }
+        Err(_) => return (axum::http::StatusCode::BAD_REQUEST, "action is not JSON").into_response(),
+    };
+
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    app.pending.lock().unwrap().insert(id, tx);
+
+    if app.to_guest.send(stamped).is_err() {
+        app.pending.lock().unwrap().remove(&id);
+        return (axum::http::StatusCode::SERVICE_UNAVAILABLE, "no desktop attached").into_response();
+    }
+
+    match tokio::time::timeout(ACTION_TIMEOUT, rx).await {
+        Ok(Ok(result)) => (
+            [(axum::http::header::CONTENT_TYPE, "application/json")],
+            result,
+        )
+            .into_response(),
+        // Timed out or the guest dropped: clean up the pending slot so a late
+        // reply is discarded rather than delivered to the next request.
+        _ => {
+            app.pending.lock().unwrap().remove(&id);
+            (axum::http::StatusCode::GATEWAY_TIMEOUT, "the desktop did not answer").into_response()
+        }
+    }
+}
+
 /// Wall-clock seconds since the epoch, for JWT expiry. Distinct from the lease's
 /// monotonic `now`: a token's exp is an absolute time, a lease's timers are
 /// relative, and conflating them would check one against the wrong clock.
@@ -659,6 +746,8 @@ mod tests {
             control_events,
             started: Instant::now(),
             next_session: AtomicU64::new(1),
+            pending: std::sync::Mutex::new(std::collections::HashMap::new()),
+            next_action: AtomicU64::new(1),
             guest_attached: std::sync::atomic::AtomicBool::new(false),
             ingest_token: "ing".into(),
             view_token: "look".into(),
@@ -748,6 +837,31 @@ mod tests {
         assert_eq!(a.control_for(Some(&guest)), None, "a guest token operated a viewer");
         assert!(!a.ingest_ok(Some(&viewer)), "a viewer token pushed a screen");
         assert!(a.ingest_ok(Some(&guest)), "a valid guest token was refused ingest");
+    }
+
+    #[test]
+    fn an_action_reply_is_matched_to_its_waiter_by_id() {
+        // §8.5: the guest answers on the stream socket, and the gateway matches
+        // the reply to the parked request by the id it stamped. A reply for an
+        // id nobody waits on (the request timed out) is dropped, not misdelivered.
+        let a = app();
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        a.pending.lock().unwrap().insert(7, tx);
+
+        // The guest's reply carries id 7.
+        let reply = r#"{"type":"result","id":7,"ok":true}"#;
+        let id = serde_json::from_str::<serde_json::Value>(reply)
+            .unwrap()
+            .get("id")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap();
+        if let Some(w) = a.pending.lock().unwrap().remove(&id) {
+            w.send(reply.to_string()).unwrap();
+        }
+        assert_eq!(rx.blocking_recv().unwrap(), reply);
+
+        // A reply for an unknown id finds no waiter and is simply dropped.
+        assert!(a.pending.lock().unwrap().remove(&999).is_none());
     }
 
     #[test]
