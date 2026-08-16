@@ -1,0 +1,27 @@
+[package]
+name = "iapetus-controlplane"
+description = "Control Plane token issuance, refresh, and revocation (PRD §8.1, §8.4)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lib]
+name = "iapetus_controlplane"
+path = "src/lib.rs"
+
+[[bin]]
+name = "iapetus-controlplane"
+path = "src/main.rs"
+
+[dependencies]
+iapetus-auth = { path = "../iapetus-auth" }
+ed25519-dalek = { version = "2", default-features = false, features = ["std"] }
+base64 = "0.22"
+sha2 = "0.10"
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+axum = { workspace = true }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "net", "signal"] }

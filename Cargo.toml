@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/iapetus-auth", "crates/iapetus-gateway", "crates/iapetus-proto", "crates/iapetusd"]
+members = ["crates/iapetus-auth", "crates/iapetus-controlplane", "crates/iapetus-gateway", "crates/iapetus-proto", "crates/iapetusd"]
 
 [workspace.package]
 version = "0.1.0"

@@ -677,6 +677,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "iapetus-controlplane"
+version = "0.1.0"
+dependencies = [
+ "axum 0.8.9",
+ "base64 0.22.1",
+ "ed25519-dalek",
+ "iapetus-auth",
+ "serde",
+ "serde_json",
+ "sha2",
+ "thiserror 2.0.20",
+ "tokio",
+]
+
+[[package]]
 name = "iapetus-gateway"
 version = "0.1.0"
 dependencies = [
