@@ -27,6 +27,7 @@ use axum::extract::State;
 use axum::response::{Html, IntoResponse};
 use axum::routing::get;
 use axum::Router;
+use iapetus_auth::{Jwks, Policy, AUDIENCE, AUDIENCE_GUEST};
 use iapetus_proto::lease::{Acquired, Actor, ControlLease};
 use tokio::sync::{broadcast, Mutex};
 
@@ -195,6 +196,10 @@ struct App {
     /// input, because routing input through the Control Plane would add a round
     /// trip to the 20–50ms budget and destroy the feel.
     write_token: String,
+    /// The verifying keys for real §8.1 JWTs. `Some` in production, where every
+    /// token is an Ed25519 JWT; `None` for local development, which falls back
+    /// to the shared secrets above so the demo needs no key material.
+    jwks: Option<Jwks>,
 }
 
 /// What a viewer socket is allowed to do (§7.5).
@@ -212,6 +217,12 @@ async fn main() {
     let ingest_token = std::env::var("IAPETUS_INGEST_TOKEN").unwrap_or_else(|_| "dev".into());
     let view_token = std::env::var("IAPETUS_VIEW_TOKEN").unwrap_or_else(|_| "dev".into());
     let write_token = std::env::var("IAPETUS_WRITE_TOKEN").unwrap_or_else(|_| "dev-write".into());
+    let jwks = std::env::var("IAPETUS_JWKS").ok().and_then(|s| parse_jwks(&s));
+    if jwks.is_some() {
+        println!("verifying §8.1 JWTs against the configured JWKS");
+    } else {
+        println!("no JWKS configured; using development shared-secret tokens");
+    }
 
     // Capacity 32: a viewer that cannot keep up should skip ahead to the newest
     // screen rather than fall further behind replaying old ones. Lag is
@@ -232,6 +243,7 @@ async fn main() {
         ingest_token,
         view_token,
         write_token,
+        jwks,
     });
 
     // Reap the lease on a timer, so a human who idles out or a holder that
@@ -264,7 +276,7 @@ async fn ingest_ws(
     State(app): State<Arc<App>>,
     axum::extract::Query(q): axum::extract::Query<std::collections::HashMap<String, String>>,
 ) -> impl IntoResponse {
-    if q.get("token").map(String::as_str) != Some(app.ingest_token.as_str()) {
+    if !app.ingest_ok(q.get("token").map(String::as_str)) {
         return (axum::http::StatusCode::UNAUTHORIZED, "bad ingest token").into_response();
     }
     if !app.try_claim_guest() {
@@ -493,6 +505,39 @@ fn control_snapshot(app: &App, _session: &str) -> String {
     format!(r#"{{"type":"control","holder":"{kind}","session":"{session}"}}"#)
 }
 
+/// Wall-clock seconds since the epoch, for JWT expiry. Distinct from the lease's
+/// monotonic `now`: a token's exp is an absolute time, a lease's timers are
+/// relative, and conflating them would check one against the wrong clock.
+fn now_epoch() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
+/// Parses `IAPETUS_JWKS` — `kid:base64url-32-byte-key` entries, comma-separated.
+///
+/// A deliberately small format: the served `/.well-known/jwks.json` is the
+/// Control Plane's job, and the gateway only needs the public keys by kid. A
+/// malformed entry drops that key rather than failing startup, so one bad line
+/// does not take the gateway down, but an empty result returns `None` so the
+/// caller falls back to dev secrets rather than refusing every token.
+fn parse_jwks(raw: &str) -> Option<Jwks> {
+    use base64::Engine;
+    let b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    let mut jwks = Jwks::new();
+    let mut any = false;
+    for entry in raw.split(',').map(str::trim).filter(|e| !e.is_empty()) {
+        let Some((kid, key_b64)) = entry.split_once(':') else { continue };
+        let Ok(bytes) = b64.decode(key_b64) else { continue };
+        let Ok(arr): Result<[u8; 32], _> = bytes.try_into() else { continue };
+        let Ok(vk) = ed25519_dalek::VerifyingKey::from_bytes(&arr) else { continue };
+        jwks.insert(kid.to_string(), vk);
+        any = true;
+    }
+    any.then_some(jwks)
+}
+
 /// Just the discriminator; the guest validates the rest.
 ///
 /// Parsed, never substring-matched. An earlier gate looked for the literal
@@ -553,12 +598,43 @@ impl App {
     }
 
     /// Resolves a viewer token to what it may do, or `None` to refuse.
+    ///
+    /// With a JWKS configured this is a real §8.1 Viewer Token: verified, then
+    /// mapped to WRITE if it carries `desktop:control` and READ otherwise. The
+    /// token only grants the *right to request* the lease — the lease itself
+    /// still decides whether input passes (§7.5). Without a JWKS it falls back
+    /// to the development shared secrets.
     fn control_for(&self, token: Option<&str>) -> Option<Control> {
+        if let Some(jwks) = &self.jwks {
+            let policy = Policy {
+                audience: AUDIENCE,
+                lifetime_cap_sec: Some(8 * 3600), // viewer cap (§8.1)
+            };
+            let claims = iapetus_auth::verify(token?, jwks, &policy, now_epoch()).ok()?;
+            return Some(if claims.has_scope("desktop:control") {
+                Control::Write
+            } else {
+                Control::Read
+            });
+        }
         match token {
             Some(t) if t == self.write_token => Some(Control::Write),
             Some(t) if t == self.view_token => Some(Control::Read),
             _ => None,
         }
+    }
+
+    /// Whether a guest token authorizes the §19.5 stream.
+    ///
+    /// A Guest token carries the `iapetus-guest` audience and no scopes (§9.1);
+    /// checking the audience is what stops a Viewer or Agent token from being
+    /// replayed to push a screen.
+    fn ingest_ok(&self, token: Option<&str>) -> bool {
+        if let Some(jwks) = &self.jwks {
+            let policy = Policy { audience: AUDIENCE_GUEST, lifetime_cap_sec: None };
+            return token.is_some_and(|t| iapetus_auth::verify(t, jwks, &policy, now_epoch()).is_ok());
+        }
+        token == Some(self.ingest_token.as_str())
     }
 }
 
@@ -587,7 +663,36 @@ mod tests {
             ingest_token: "ing".into(),
             view_token: "look".into(),
             write_token: "drive".into(),
+            jwks: None,
         }
+    }
+
+    /// A gateway whose tokens are real JWTs, for the auth-path tests.
+    fn app_with_jwks() -> (App, iapetus_auth::Issuer) {
+        use ed25519_dalek::SigningKey;
+        let issuer = iapetus_auth::Issuer::new("k1", SigningKey::from_bytes(&[3u8; 32]), "iss");
+        let mut jwks = Jwks::new();
+        jwks.insert("k1", issuer.verifying_key());
+        let mut a = app();
+        a.jwks = Some(jwks);
+        (a, issuer)
+    }
+
+    fn viewer_token(issuer: &iapetus_auth::Issuer, scopes: &[&str], aud: &str) -> String {
+        let now = now_epoch();
+        issuer.sign(iapetus_auth::Claims {
+            jti: "j".into(),
+            iss: "unset".into(),
+            aud: aud.into(),
+            sub: "usr".into(),
+            actor_type: iapetus_auth::ActorType::Human,
+            project_id: "p".into(),
+            desktop_ids: vec!["dsk".into()],
+            scopes: scopes.iter().map(|s| s.to_string()).collect(),
+            iat: now,
+            exp: now + 900,
+            orig_iat: now,
+        })
     }
 
     #[test]
@@ -604,6 +709,45 @@ mod tests {
         assert_eq!(kf.kind, "keyframe");
 
         assert!(serde_json::from_str::<Envelope>("not json").is_err());
+    }
+
+    #[test]
+    fn a_real_jwt_maps_to_write_or_read_by_its_control_scope() {
+        // With a JWKS the shared secrets are gone: a token is a §8.1 JWT, and
+        // desktop:control is what separates operating from observing.
+        let (a, iss) = app_with_jwks();
+
+        let writer = viewer_token(&iss, &["desktop:control"], AUDIENCE);
+        assert_eq!(a.control_for(Some(&writer)), Some(Control::Write));
+
+        let reader = viewer_token(&iss, &["desktop:read"], AUDIENCE);
+        assert_eq!(a.control_for(Some(&reader)), Some(Control::Read));
+
+        // A forged token — signed by the wrong key — is refused outright.
+        let forged = iapetus_auth::Issuer::new("k1", ed25519_dalek::SigningKey::from_bytes(&[9u8; 32]), "x")
+            .sign(iapetus_auth::Claims {
+                jti: "j".into(), iss: "x".into(), aud: AUDIENCE.into(), sub: "attacker".into(),
+                actor_type: iapetus_auth::ActorType::Human, project_id: "p".into(),
+                desktop_ids: vec![], scopes: vec!["desktop:control".into()],
+                iat: now_epoch(), exp: now_epoch() + 900, orig_iat: now_epoch(),
+            });
+        assert_eq!(a.control_for(Some(&forged)), None, "a token signed by the wrong key was accepted");
+
+        // The dev shared secret is not a JWT, so once a JWKS is set it is refused.
+        assert_eq!(a.control_for(Some("drive")), None);
+    }
+
+    #[test]
+    fn a_guest_token_is_refused_at_the_viewer_endpoint_and_vice_versa() {
+        // §9.1: audiences keep the roles apart. A Guest token pushes screens; a
+        // Viewer token operates. Neither may stand in for the other.
+        let (a, iss) = app_with_jwks();
+        let guest = viewer_token(&iss, &[], AUDIENCE_GUEST);
+        let viewer = viewer_token(&iss, &["desktop:control"], AUDIENCE);
+
+        assert_eq!(a.control_for(Some(&guest)), None, "a guest token operated a viewer");
+        assert!(!a.ingest_ok(Some(&viewer)), "a viewer token pushed a screen");
+        assert!(a.ingest_ok(Some(&guest)), "a valid guest token was refused ingest");
     }
 
     #[test]

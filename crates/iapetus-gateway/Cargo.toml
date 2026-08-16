@@ -11,7 +11,10 @@ repository.workspace = true
 # §19.7 puts the Control Plane on axum + tokio; the gateway sits beside it and
 # shares the stack rather than introducing a second one.
 axum = { workspace = true, features = ["ws"] }
+base64 = "0.23.1"
+ed25519-dalek = { version = "2.1.1", default-features = false, features = ["std"] }
 futures-util = { version = "0.3.34", default-features = false, features = ["sink", "std"] }
+iapetus-auth = { version = "0.1.0", path = "../iapetus-auth" }
 iapetus-proto = { version = "0.1.0", path = "../iapetus-proto" }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
