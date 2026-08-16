@@ -167,6 +167,10 @@ struct App {
     /// endpoint open to whatever can reach the port hands a stranger both the
     /// screen and the keyboard.
     view_token: String,
+    /// Whether a guest currently holds `/ingest`. One Desktop, one stream: a
+    /// second guest's frames would interleave into the same broadcast and every
+    /// viewer would watch two screens shuffled together.
+    guest_attached: std::sync::atomic::AtomicBool,
     /// The token that additionally grants `WRITE`. §7.5 puts this check in the
     /// gateway: it verifies the session holds the lease before forwarding
     /// input, because routing input through the Control Plane would add a round
@@ -200,6 +204,7 @@ async fn main() {
         frames,
         to_guest,
         cache: Mutex::new(TileCache::default()),
+        guest_attached: std::sync::atomic::AtomicBool::new(false),
         ingest_token,
         view_token,
         write_token,
@@ -223,6 +228,9 @@ async fn ingest_ws(
 ) -> impl IntoResponse {
     if q.get("token").map(String::as_str) != Some(app.ingest_token.as_str()) {
         return (axum::http::StatusCode::UNAUTHORIZED, "bad ingest token").into_response();
+    }
+    if !app.try_claim_guest() {
+        return (axum::http::StatusCode::CONFLICT, "a guest is already streaming").into_response();
     }
     ws.on_upgrade(move |socket| guest_socket(socket, app))
 }
@@ -254,6 +262,7 @@ async fn guest_socket(socket: WebSocket, app: Arc<App>) {
     }
 
     pump.abort();
+    app.release_guest();
     println!("guest detached");
 }
 
@@ -307,15 +316,11 @@ async fn viewer_socket(socket: WebSocket, app: Arc<App>, level: Control) {
         }
     });
 
-    // Input, straight through. The gateway does not interpret it — §7.5 puts
-    // the coalescing in the viewer and the lease check here; turning it into
-    // actions is the guest's job, on the same queue as agent actions.
+    // Input, forwarded per the socket's control level. Turning it into actions
+    // stays the guest's job, on the same queue as agent actions (§7.5).
     while let Some(Ok(msg)) = rx.next().await {
         let Message::Text(t) = msg else { continue };
-        // A keyframe request is not input: a READ viewer still needs a picture,
-        // and refusing it would leave an observer staring at a blank canvas.
-        let is_keyframe = t.contains(r#""keyframe""#);
-        if level == Control::Read && !is_keyframe {
+        if !may_forward(&t, level) {
             continue;
         }
         let _ = app.to_guest.send(t.to_string());
@@ -324,7 +329,46 @@ async fn viewer_socket(socket: WebSocket, app: Arc<App>, level: Control) {
     out.abort();
 }
 
+/// Just the discriminator; the guest validates the rest.
+#[derive(serde::Deserialize)]
+struct Envelope {
+    #[serde(rename = "type")]
+    kind: String,
+}
+
+/// Whether a viewer message may reach the guest at this control level.
+///
+/// Parsed, not substring-matched. An earlier version looked for the literal
+/// `"keyframe"` anywhere in the text, which let a READ viewer smuggle input by
+/// embedding that string in a `type` payload — an observer injecting keystrokes
+/// into a desktop it was only allowed to watch. The discriminator is the only
+/// honest place to look.
+///
+/// A message that does not parse is dropped for every level: the guest would
+/// drop it too, and forwarding bytes we cannot classify means the READ gate is
+/// only as strong as the guest's parser agreeing with ours.
+fn may_forward(text: &str, level: Control) -> bool {
+    let Ok(env) = serde_json::from_str::<Envelope>(text) else {
+        return false;
+    };
+    match level {
+        Control::Write => true,
+        // A keyframe request is not input — an observer still needs a picture,
+        // and refusing it would leave a READ viewer on a blank canvas.
+        Control::Read => env.kind == "keyframe",
+    }
+}
+
 impl App {
+    /// Claims the single guest slot; `false` means one is already attached.
+    fn try_claim_guest(&self) -> bool {
+        !self.guest_attached.swap(true, std::sync::atomic::Ordering::SeqCst)
+    }
+
+    fn release_guest(&self) {
+        self.guest_attached.store(false, std::sync::atomic::Ordering::SeqCst);
+    }
+
     /// Resolves a viewer token to what it may do, or `None` to refuse.
     fn control_for(&self, token: Option<&str>) -> Option<Control> {
         match token {
@@ -351,10 +395,38 @@ mod tests {
             frames,
             to_guest,
             cache: Mutex::new(TileCache::default()),
+            guest_attached: std::sync::atomic::AtomicBool::new(false),
             ingest_token: "ing".into(),
             view_token: "look".into(),
             write_token: "drive".into(),
         }
+    }
+
+    #[test]
+    fn a_read_viewer_cannot_smuggle_input_past_the_gate() {
+        // The regression this guards: the gate used to substring-match
+        // `"keyframe"`, so a READ viewer could embed it in a `type` payload and
+        // have the guest type its text — an observer injecting keystrokes.
+        let evil = r#"{"type":"type","text":"stolen \"keyframe\" text"}"#;
+        assert!(!may_forward(evil, Control::Read), "input smuggled past the READ gate");
+        assert!(may_forward(evil, Control::Write), "the same message is legitimate at WRITE");
+
+        assert!(may_forward(r#"{"type":"keyframe"}"#, Control::Read));
+        assert!(!may_forward(r#"{"type":"mouse.move","x":1,"y":2}"#, Control::Read));
+        // Unclassifiable bytes are dropped for everyone; forwarding them makes
+        // the gate only as strong as two parsers agreeing.
+        assert!(!may_forward("not json", Control::Write));
+    }
+
+    #[test]
+    fn only_one_guest_may_stream_at_a_time() {
+        // A second guest's frames would interleave into the same broadcast and
+        // every viewer would watch two screens shuffled together.
+        let a = app();
+        assert!(a.try_claim_guest());
+        assert!(!a.try_claim_guest(), "a second guest was accepted");
+        a.release_guest();
+        assert!(a.try_claim_guest(), "the slot did not free on detach");
     }
 
     #[test]

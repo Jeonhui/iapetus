@@ -245,6 +245,13 @@ fn damage_probe() -> ExitCode {
 fn stream_bench(seconds: u64) -> ExitCode {
     use iapetusd::stream::{TileEncoder, DEFAULT_QUALITY};
 
+    // This lesson was learned by publishing wrong numbers: a debug build
+    // measured 106ms where release measures 22. The tool now says so itself
+    // rather than trusting whoever ran it to remember.
+    if cfg!(debug_assertions) {
+        eprintln!("warning: DEBUG build — timings are inflated several-fold; benchmark with --release");
+    }
+
     let d = build_dispatcher();
     let mut enc = TileEncoder::new(DEFAULT_QUALITY);
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(seconds);

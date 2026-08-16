@@ -334,7 +334,14 @@ impl Display for X11Display {
                 return Err(PlatformError::CaptureFailed(format!("poll on the X socket: {e}")));
             }
             if r == 0 {
-                return Ok(false); // timed out with the screen untouched
+                // Timed out — but go round once more instead of returning. A
+                // concurrent request on this shared connection (a capture, a
+                // window query) reads the socket, and any damage event that
+                // arrived with its reply is now in x11rb's queue, not on the
+                // descriptor. The drain at the top of the loop is the only
+                // place that sees it; the deadline check right after it turns
+                // this into one extra pass, not a spin.
+                continue;
             }
         }
     }
