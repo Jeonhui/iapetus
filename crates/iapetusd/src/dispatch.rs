@@ -175,6 +175,14 @@ impl Dispatcher {
         self.frames.capture_now(None)
     }
 
+    /// Blocks until the screen changes or `timeout` elapses.
+    ///
+    /// Backed by XDamage. This is what lets the stream idle instead of
+    /// capturing a picture identical to the one it already sent (§6.3).
+    pub fn wait_for_change(&self, timeout: Duration) -> crate::platform::Result<bool> {
+        self.frames.wait_for_change(timeout)
+    }
+
     /// Executes one action, reporting failure as a result rather than an error.
     ///
     /// The channel needs this shape: a failed action is an answer the agent can

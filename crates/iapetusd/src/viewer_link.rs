@@ -116,13 +116,45 @@ pub async fn run(
     // ── Screen, guest → viewer ───────────────────────────────
     let mut enc = TileEncoder::new(DEFAULT_QUALITY);
     let mut next = Instant::now();
+    let mut last_capture = Instant::now() - IDLE_RESYNC;
     loop {
         // A keyframe request jumps the queue: a viewer staring at a blank
         // canvas should not have to wait out the frame interval.
-        let forced = kf_rx.try_recv().is_ok();
-        if forced {
+        let mut wanted = kf_rx.try_recv().is_ok();
+        if wanted {
             enc.invalidate();
         }
+
+        // Spend the interval waiting on XDamage rather than sleeping through
+        // it. An untouched screen then costs nothing at all — capturing it
+        // would encode a picture identical to the one already sent, which is
+        // the waste §6.3 asks the Frame Source to avoid by idling.
+        //
+        // Damage returning early does not raise the frame rate: the remainder
+        // of the interval is still held, so the §6.3 ceiling stands.
+        let now = Instant::now();
+        if !wanted && next > now {
+            let budget = next - now;
+            let d = Arc::clone(&dispatcher);
+            match tokio::task::spawn_blocking(move || d.wait_for_change(budget)).await {
+                Ok(Ok(changed)) => wanted |= changed,
+                // A display error is reported by the capture below, which has
+                // somewhere to put it; treating it as "something changed" gets
+                // us there rather than spinning on the wait.
+                Ok(Err(_)) => wanted = true,
+                Err(e) => return Err(format!("damage wait task: {e}")),
+            }
+            let now = Instant::now();
+            if next > now {
+                tokio::time::sleep(next - now).await;
+            }
+        }
+        next = Instant::now() + frame_interval;
+
+        if !wanted && last_capture.elapsed() < IDLE_RESYNC {
+            continue;
+        }
+        last_capture = Instant::now();
 
         let d = Arc::clone(&dispatcher);
         let update = match tokio::task::spawn_blocking(move || {
@@ -130,7 +162,7 @@ pub async fn run(
         })
         .await
         {
-            Ok(Ok((frame, ()))) => match enc.encode(&frame, forced) {
+            Ok(Ok((frame, ()))) => match enc.encode(&frame, false) {
                 Ok(u) => u,
                 Err(e) => return Err(format!("encoding a frame: {e}")),
             },
@@ -147,21 +179,28 @@ pub async fn run(
             break;
         }
 
-        next += frame_interval;
-        let now = Instant::now();
-        if next > now {
-            tokio::time::sleep(next - now).await;
-        } else {
-            // Fell behind — encoding took longer than the interval. Resync to
-            // now rather than trying to catch up, which would spin without ever
-            // recovering.
-            next = now;
+        // The pacing wait happens at the top of the loop, where it can double as
+        // the damage wait. Encoding that overran the interval simply means the
+        // next wait is short or absent, which is the right behaviour: it does
+        // not try to catch up by capturing back to back.
+        if next < Instant::now() {
+            next = Instant::now();
         }
     }
 
     input_task.abort();
     Ok(())
 }
+
+/// How long the stream will go without capturing, however quiet XDamage is.
+///
+/// A safety net, not a frame rate. Damage on the root window is reported by
+/// every X server tested here, but a driver or a compositor that failed to
+/// report some region would otherwise freeze the viewer indefinitely, and a
+/// frozen picture is indistinguishable from a still one. Two seconds bounds
+/// that to a visible stutter instead, at a cost of one capture per Desktop per
+/// two seconds.
+pub const IDLE_RESYNC: Duration = Duration::from_secs(2);
 
 /// The interval matching §6.3's 5–10fps fallback ceiling.
 #[must_use]

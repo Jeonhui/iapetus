@@ -18,7 +18,6 @@
 //! API actions an agent sends. Anything else would split the audit log and make
 //! lease arbitration impossible.
 
-use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
@@ -28,17 +27,54 @@ use axum::routing::get;
 use axum::Router;
 use tokio::sync::{broadcast, Mutex};
 
-/// Newest JPEG per tile position, which is all a new viewer needs to start.
+/// One cached rectangle of the screen.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Region {
+    x: u16,
+    y: u16,
+    w: u16,
+    h: u16,
+    jpeg: Vec<u8>,
+}
+
+impl Region {
+    /// Whether this region completely covers `other`, which can then never show
+    /// through again and is dropped.
+    fn covers(&self, other: &Region) -> bool {
+        self.x <= other.x
+            && self.y <= other.y
+            && u32::from(self.x) + u32::from(self.w) >= u32::from(other.x) + u32::from(other.w)
+            && u32::from(self.y) + u32::from(self.h) >= u32::from(other.y) + u32::from(other.h)
+    }
+}
+
+/// Enough of the screen to bootstrap a viewer that joined mid-stream.
+///
+/// **In insertion order, not sorted by position.** The guest sends arbitrary
+/// rectangles — one small one when a cursor blinked, one large one when much of
+/// the screen changed at once — so a later region can overlap an earlier one.
+/// Replaying them in position order would draw the older rectangle on top and
+/// show a new viewer a patch of the past.
 #[derive(Default)]
 struct TileCache {
     width: u16,
     height: u16,
-    tiles: BTreeMap<(u16, u16), (u16, u16, Vec<u8>)>,
+    regions: Vec<Region>,
 }
 
+/// Above this many cached regions the cache is dropped and the guest asked for
+/// a fresh keyframe.
+///
+/// Partially-overlapping rectangles are never evicted by the covering rule, so
+/// without a bound a long-lived stream of odd shapes could grow without limit.
+/// Rebuilding is cheap and self-healing; a leak is neither.
+const MAX_REGIONS: usize = 4096;
+
 impl TileCache {
-    /// Splits an update into its tiles. Framing only — no pixel is examined,
+    /// Splits an update into its regions. Framing only — no pixel is examined,
     /// which is what §19.6 means by the gateway never decoding.
+    ///
+    /// Returns `None` on a malformed update, leaving the cache untouched.
     fn apply(&mut self, buf: &[u8]) -> Option<()> {
         if buf.len() < 12 {
             return None;
@@ -52,12 +88,13 @@ impl TileCache {
         // that no longer exists, and handing them to a viewer would paint stale
         // regions that never get overwritten.
         if keyframe || (self.width, self.height) != (width, height) {
-            self.tiles.clear();
+            self.regions.clear();
         }
         self.width = width;
         self.height = height;
 
         let mut off = 12usize;
+        let mut parsed = Vec::with_capacity(count as usize);
         for _ in 0..count {
             if buf.len() < off + 12 {
                 return None;
@@ -71,8 +108,19 @@ impl TileCache {
             if buf.len() < off + len {
                 return None;
             }
-            self.tiles.insert((x, y), (w, h, buf[off..off + len].to_vec()));
+            parsed.push(Region { x, y, w, h, jpeg: buf[off..off + len].to_vec() });
             off += len;
+        }
+
+        // Applied only after the whole update parsed. Half-applying a truncated
+        // one would leave the cache describing a frame that never existed, and
+        // every viewer bootstrapped from it inherits the corruption.
+        for r in parsed {
+            self.regions.retain(|old| !r.covers(old));
+            self.regions.push(r);
+        }
+        if self.regions.len() > MAX_REGIONS {
+            self.regions.clear();
         }
         Some(())
     }
@@ -80,7 +128,7 @@ impl TileCache {
     /// Rebuilds a keyframe from what is cached, in the same wire format the
     /// guest emits, so the viewer needs no second code path to apply it.
     fn keyframe(&self) -> Option<Vec<u8>> {
-        if self.tiles.is_empty() {
+        if self.regions.is_empty() {
             return None;
         }
         let mut out = Vec::new();
@@ -89,14 +137,14 @@ impl TileCache {
         out.extend_from_slice(&self.height.to_be_bytes());
         out.push(1); // keyframe
         out.push(0);
-        out.extend_from_slice(&(self.tiles.len() as u16).to_be_bytes());
-        for ((x, y), (w, h, jpeg)) in &self.tiles {
-            out.extend_from_slice(&x.to_be_bytes());
-            out.extend_from_slice(&y.to_be_bytes());
-            out.extend_from_slice(&w.to_be_bytes());
-            out.extend_from_slice(&h.to_be_bytes());
-            out.extend_from_slice(&(jpeg.len() as u32).to_be_bytes());
-            out.extend_from_slice(jpeg);
+        out.extend_from_slice(&(self.regions.len() as u16).to_be_bytes());
+        for r in &self.regions {
+            out.extend_from_slice(&r.x.to_be_bytes());
+            out.extend_from_slice(&r.y.to_be_bytes());
+            out.extend_from_slice(&r.w.to_be_bytes());
+            out.extend_from_slice(&r.h.to_be_bytes());
+            out.extend_from_slice(&(r.jpeg.len() as u32).to_be_bytes());
+            out.extend_from_slice(&r.jpeg);
         }
         Some(out)
     }
@@ -291,6 +339,11 @@ impl App {
 mod tests {
     use super::*;
 
+    /// The bytes cached at a position, for tests that care about content.
+    fn at(c: &TileCache, x: u16, y: u16) -> &[u8] {
+        &c.regions.iter().rev().find(|r| r.x == x && r.y == y).expect("no region there").jpeg
+    }
+
     fn app() -> App {
         let (frames, _) = broadcast::channel(4);
         let (to_guest, _) = broadcast::channel(4);
@@ -355,9 +408,11 @@ mod tests {
             .unwrap();
         c.apply(&update(128, 64, false, &[(64, 0, 64, 64, b"B2")])).unwrap();
 
-        assert_eq!(c.tiles.len(), 2);
-        assert_eq!(c.tiles[&(0, 0)].2, b"A", "an untouched tile was lost");
-        assert_eq!(c.tiles[&(64, 0)].2, b"B2", "a changed tile was not replaced");
+        // The untouched tile survives and the changed one is present; the
+        // replaced copy must not linger underneath.
+        assert_eq!(c.regions.len(), 2, "a superseded copy was kept");
+        assert_eq!(at(&c, 0, 0), b"A", "an untouched tile was lost");
+        assert_eq!(at(&c, 64, 0), b"B2", "a changed tile was not replaced");
     }
 
     #[test]
@@ -366,7 +421,7 @@ mod tests {
         c.apply(&update(128, 64, true, &[(0, 0, 64, 64, b"A"), (64, 0, 64, 64, b"B")]))
             .unwrap();
         c.apply(&update(128, 64, true, &[(0, 0, 64, 64, b"C")])).unwrap();
-        assert_eq!(c.tiles.len(), 1, "a stale tile survived a keyframe");
+        assert_eq!(c.regions.len(), 1, "a stale tile survived a keyframe");
     }
 
     #[test]
@@ -376,8 +431,32 @@ mod tests {
         let mut c = TileCache::default();
         c.apply(&update(128, 64, true, &[(0, 0, 64, 64, b"A")])).unwrap();
         c.apply(&update(256, 128, false, &[(0, 0, 64, 64, b"Z")])).unwrap();
-        assert_eq!(c.tiles.len(), 1);
+        assert_eq!(c.regions.len(), 1);
         assert_eq!((c.width, c.height), (256, 128));
+    }
+
+    #[test]
+    fn a_region_that_covers_an_older_one_wins_in_the_rebuilt_keyframe() {
+        // Regions are arbitrary rectangles, not a fixed grid: the guest sends a
+        // small tile when one thing moved and one big rectangle when much did.
+        // So a later region can cover an earlier one, and rebuilding in position
+        // order would draw the stale small tile on top of the fresh big one —
+        // a viewer joining late would see a patch of the past.
+        let mut c = TileCache::default();
+        c.apply(&update(256, 128, true, &[(0, 0, 256, 128, b"OLD-FULL")])).unwrap();
+        c.apply(&update(256, 128, false, &[(100, 40, 64, 64, b"PATCH")])).unwrap();
+        c.apply(&update(256, 128, false, &[(0, 0, 256, 128, b"NEW-FULL")])).unwrap();
+
+        let kf = c.keyframe().expect("no keyframe");
+        let mut round = TileCache::default();
+        round.apply(&kf).unwrap();
+
+        assert_eq!(
+            round.regions.len(),
+            1,
+            "the covered patch was kept and would repaint stale pixels"
+        );
+        assert_eq!(at(&round, 0, 0), b"NEW-FULL");
     }
 
     #[test]
@@ -395,7 +474,7 @@ mod tests {
 
         let mut round = TileCache::default();
         round.apply(&kf).expect("the rebuilt keyframe did not parse");
-        assert_eq!(round.tiles, c.tiles);
+        assert_eq!(round.regions, c.regions, "the rebuild is not order-preserving");
     }
 
     #[test]
@@ -408,11 +487,29 @@ mod tests {
         // Half-applying leaves the cache describing a frame that never existed,
         // and every viewer bootstrapped from it inherits the corruption.
         let mut c = TileCache::default();
-        let mut buf = update(128, 64, true, &[(0, 0, 64, 64, b"AAAA")]);
+        c.apply(&update(128, 64, true, &[(0, 0, 64, 64, b"GOOD")])).unwrap();
+
+        let mut buf = update(128, 64, false, &[(0, 0, 64, 64, b"AAAA"), (64, 0, 64, 64, b"BBBB")]);
         buf.truncate(buf.len() - 2);
         assert!(c.apply(&buf).is_none());
+        assert_eq!(c.regions.len(), 1, "a partial update reached the cache");
+        assert_eq!(at(&c, 0, 0), b"GOOD", "the good frame was overwritten by a bad one");
 
         let mut short = TileCache::default();
         assert!(short.apply(&[0u8; 4]).is_none());
+    }
+
+    #[test]
+    fn the_cache_cannot_grow_without_bound() {
+        // Partially-overlapping rectangles are never evicted by the covering
+        // rule, so a long-lived stream of odd shapes would otherwise grow
+        // forever. Clearing is self-healing — the next viewer asks the guest
+        // for a keyframe — where a leak is not.
+        let mut c = TileCache::default();
+        for i in 0..(MAX_REGIONS + 10) {
+            let x = (i % 500) as u16;
+            c.apply(&update(2000, 2000, false, &[(x, 0, 1, 1, b"x")])).unwrap();
+        }
+        assert!(c.regions.len() <= MAX_REGIONS, "cache grew to {}", c.regions.len());
     }
 }

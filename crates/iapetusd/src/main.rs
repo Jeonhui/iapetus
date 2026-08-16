@@ -40,6 +40,7 @@ fn main() -> ExitCode {
         Some("--connect") => connect(),
         Some("--screenshot") => screenshot(args.get(1).map(String::as_str)),
         Some("--stream") => stream(args.get(1).map(String::as_str)),
+        Some("--damage-probe") => damage_probe(),
         Some("--stream-bench") => stream_bench(args.get(1).and_then(|s| s.parse().ok()).unwrap_or(10)),
         Some(other) => {
             eprintln!("unknown argument: {other}");
@@ -210,6 +211,30 @@ fn stream(endpoint: Option<&str>) -> ExitCode {
             tokio::time::sleep(backoff.next(iapetusd::channel::jitter_unit())).await;
         }
     })
+}
+
+/// Counts how often XDamage reports a change, so "the screen is quiet" can be
+/// distinguished from "the damage signal is useless here".
+///
+/// The difference decides whether the stream can idle at all: if damage fires
+/// on an empty root window, waiting on it saves nothing and the cost has to
+/// come out of capture instead.
+fn damage_probe() -> ExitCode {
+    let d = build_dispatcher();
+    let (mut fired, mut quiet) = (0u32, 0u32);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while std::time::Instant::now() < deadline {
+        match d.wait_for_change(std::time::Duration::from_millis(100)) {
+            Ok(true) => fired += 1,
+            Ok(false) => quiet += 1,
+            Err(e) => {
+                eprintln!("damage wait: {e}");
+                return ExitCode::FAILURE;
+            }
+        }
+    }
+    println!("over 10s of 100ms waits: {fired} reported a change, {quiet} timed out quiet");
+    ExitCode::SUCCESS
 }
 
 /// Measures where a streamed frame's time and bytes actually go.

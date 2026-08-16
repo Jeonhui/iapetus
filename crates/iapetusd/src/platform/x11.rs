@@ -290,6 +290,11 @@ impl Display for X11Display {
 
         let deadline = Instant::now() + timeout;
         loop {
+            // Drain what is already buffered first. x11rb reads ahead, so the
+            // event we are waiting for can be sitting in its queue while the
+            // socket has nothing left to read — blocking on the descriptor at
+            // that point would wait out the whole timeout for news that has
+            // already arrived.
             while let Some(ev) = self.conn.poll_for_event().map_err(x11_err("poll_for_event"))? {
                 if let Event::DamageNotify(_) = ev {
                     // Subtract so the region is reported again next time it
@@ -301,14 +306,36 @@ impl Display for X11Display {
                     return Ok(true);
                 }
             }
-            if Instant::now() >= deadline {
+
+            let now = Instant::now();
+            if now >= deadline {
                 return Ok(false);
             }
-            // A 5ms tick costs ~200 idle wakeups per second, far below the
-            // ~0.01 vCPU §6.3 budgets for an unwatched Desktop. Polling the
-            // connection's file descriptor would remove even that; it is an
-            // optimization, not a correctness fix.
-            sleep(Duration::from_millis(5).min(deadline - Instant::now()));
+
+            // Block on the connection's descriptor rather than waking every few
+            // milliseconds to ask again. A Desktop where nothing is happening
+            // then costs no wakeups at all, which is what §6.3 means by the
+            // Frame Source idling rather than polling — and a host runs dozens
+            // of them, so a few hundred needless wakeups each is real capacity
+            // (§12.4).
+            let fd = std::os::unix::io::AsRawFd::as_raw_fd(self.conn.stream());
+            let ms = (deadline - now).as_millis().min(i32::MAX as u128) as i32;
+            let mut pfd = libc::pollfd { fd, events: libc::POLLIN, revents: 0 };
+            // SAFETY: one initialised pollfd, a live descriptor owned by the
+            // connection, and a non-negative timeout.
+            let r = unsafe { libc::poll(&mut pfd, 1, ms) };
+            if r < 0 {
+                let e = std::io::Error::last_os_error();
+                // A signal during the wait is not a failure; go round again and
+                // let the deadline decide.
+                if e.kind() == std::io::ErrorKind::Interrupted {
+                    continue;
+                }
+                return Err(PlatformError::CaptureFailed(format!("poll on the X socket: {e}")));
+            }
+            if r == 0 {
+                return Ok(false); // timed out with the screen untouched
+            }
         }
     }
 }

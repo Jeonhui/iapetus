@@ -22,7 +22,7 @@ use iapetusd::platform::{Button, Display, Input, Rect};
 
 use x11rb::connection::Connection;
 use x11rb::protocol::xproto::{
-    ConnectionExt as _, CreateWindowAux, EventMask, WindowClass,
+    ConnectionExt as _, CreateGCAux, CreateWindowAux, EventMask, Rectangle, WindowClass,
 };
 use x11rb::protocol::Event;
 use x11rb::rust_connection::RustConnection;
@@ -389,4 +389,54 @@ fn waiting_for_a_window_that_never_opens_times_out_rather_than_erroring() {
     // A pid that owns no window. 1 is init, which never maps one.
     let r = display.wait_for_window(1, Duration::from_millis(300)).expect("must not error");
     assert!(r.is_none(), "a window was attributed to pid 1");
+}
+
+#[test]
+fn a_quiet_screen_reports_no_change_and_a_real_one_does() {
+    require_x11!();
+
+    // The stream idles by waiting on this signal instead of capturing (§6.3).
+    // Both halves matter and neither is visible in a CPU measurement: a signal
+    // that never fires makes the viewer freeze on a stale picture, and one that
+    // always fires makes idling pointless. A frozen screen looks exactly like a
+    // still one, so nothing downstream can catch the first case.
+    let display = X11Display::open().expect("no display");
+
+    // Drain whatever the session generated while starting up.
+    let settle = std::time::Instant::now();
+    while settle.elapsed() < Duration::from_secs(2) {
+        let _ = display.wait_for_change(Duration::from_millis(100));
+    }
+
+    let quiet = (0..10)
+        .filter(|_| display.wait_for_change(Duration::from_millis(100)).unwrap_or(true))
+        .count();
+    assert!(
+        quiet <= 2,
+        "{quiet}/10 waits reported a change on an untouched screen; idling on \
+         this signal would save nothing"
+    );
+
+    // Now put something on screen and require the signal to notice.
+    //
+    // Drawing, not just mapping: a window created without a background paints
+    // nothing when it appears, so it generates no damage and reporting none
+    // would be correct. What has to be caught is actual drawing, which is what
+    // an application does.
+    let win = TestWindow::open(300, 300, 400, 300);
+    let gc = win.conn.generate_id().expect("generate_id");
+    win.conn
+        .create_gc(gc, win.win, &CreateGCAux::new().foreground(0x00FF_00FF))
+        .expect("create_gc");
+
+    let noticed = (0..20).any(|_| {
+        let _ = win.conn.poly_fill_rectangle(
+            win.win,
+            gc,
+            &[Rectangle { x: 0, y: 0, width: 400, height: 300 }],
+        );
+        let _ = win.conn.flush();
+        display.wait_for_change(Duration::from_millis(200)).unwrap_or(false)
+    });
+    assert!(noticed, "drawing into a window produced no damage — the stream would freeze");
 }
