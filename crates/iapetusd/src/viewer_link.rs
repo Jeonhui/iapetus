@@ -41,6 +41,11 @@ enum ViewerInput {
     /// A viewer joined, or lost its place in the stream, and needs a full frame.
     #[serde(rename = "keyframe")]
     Keyframe,
+    /// The lease changed hands. Every held key and pointer button must be
+    /// released before the new holder's input arrives, or a chord the previous
+    /// holder left down turns the newcomer's typing into shortcuts (§5.6).
+    #[serde(rename = "release_all")]
+    ReleaseAll,
 }
 
 fn button(name: &str) -> i32 {
@@ -69,7 +74,7 @@ fn to_action(input: ViewerInput) -> Option<v1::Action> {
         // arrive as jamo).
         ViewerInput::Type { text } => Kind::TypeText(v1::TypeText { text, delay_ms: None }),
         ViewerInput::Key { keys } => Kind::Key(v1::KeyPress { keys, count: Some(1) }),
-        ViewerInput::Keyframe => return None,
+        ViewerInput::Keyframe | ViewerInput::ReleaseAll => return None,
     };
     Some(v1::Action { kind: Some(kind) })
 }
@@ -103,6 +108,14 @@ pub async fn run(
                 };
                 if matches!(parsed, ViewerInput::Keyframe) {
                     let _ = kf_tx.send(()).await;
+                    continue;
+                }
+                if matches!(parsed, ViewerInput::ReleaseAll) {
+                    // §5.6 handover: release everything the previous holder left
+                    // down. Runs on the blocking pool because the driver is
+                    // blocking, like every other action.
+                    let d = Arc::clone(&d);
+                    let _ = tokio::task::spawn_blocking(move || d.release_all()).await;
                     continue;
                 }
                 let Some(action) = to_action(parsed) else { continue };

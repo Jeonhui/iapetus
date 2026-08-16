@@ -586,6 +586,7 @@ version = "0.1.0"
 dependencies = [
  "axum 0.8.9",
  "futures-util",
+ "iapetus-proto",
  "serde",
  "serde_json",
  "tokio",

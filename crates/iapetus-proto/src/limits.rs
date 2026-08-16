@@ -66,6 +66,14 @@ pub const TIMEOUT_WAIT_FOR_MS: (u32, u32) = (10_000, 120_000);
 pub const HEARTBEAT_INTERVAL_DEFAULT_SEC: u32 = 30;
 pub const LEASE_MISSED_INTERVALS: u32 = 3;
 
+/// §5.6: a human's lease passes to a waiting agent only after this long with no
+/// input, never on demand. 300s, not 60: at a minute the agent would seize the
+/// keyboard mid-2FA while the person reads a text (S4).
+pub const HUMAN_IDLE_HANDOVER_SEC: u32 = 300;
+
+/// §5.6: what a rejected agent is told to wait before retrying (`retry_after_sec`).
+pub const CONTROL_RETRY_AFTER_SEC: u32 = 30;
+
 #[must_use]
 pub const fn lease_ttl_sec(heartbeat_interval_sec: u32) -> u32 {
     heartbeat_interval_sec * LEASE_MISSED_INTERVALS

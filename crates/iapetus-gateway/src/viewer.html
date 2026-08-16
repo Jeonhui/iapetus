@@ -30,6 +30,15 @@
            outline: none; cursor: default; box-shadow: 0 0 0 1px #222831; }
   canvas:focus { box-shadow: 0 0 0 2px #3b6fd4; }
   #ime { position: absolute; opacity: 0; pointer-events: none; width: 1px; height: 1px; }
+  .btn { font: inherit; font-size: 12px; padding: 3px 12px; border-radius: 6px;
+         border: 1px solid #2c3d78; background: #182135; color: #cdd6f4;
+         cursor: pointer; }
+  .btn { background: #182135; }
+  .btn:hover { background: #223056; }
+  .btn:disabled { opacity: .4; cursor: default; }
+  .lease.you { color: #7ee2a8; border-color: #1f5e3c; background: #12241a; }
+  .lease.agent { color: #9db4ff; border-color: #2c3d78; background: #151b2e; }
+  .lease.other { color: #f0b429; border-color: #6b5116; background: #2a2110; }
 </style>
 
 <header>
@@ -37,7 +46,9 @@
   <span class="badge fallback" title="WebRTC unavailable; running the §6.3 JPEG fallback at 5–10fps">
     fallback · JPEG
   </span>
-  <span class="badge lease" id="lease">you are operating</span>
+  <span class="badge lease" id="lease">observing</span>
+  <button id="opBtn" class="btn">Take control</button>
+  <button id="relBtn" class="btn" hidden>Release</button>
   <span class="stat" id="stat">connecting…</span>
 </header>
 
@@ -76,15 +87,75 @@ ws.onclose = (ev) => {
   // "disconnected" would send the user looking at their network instead.
   statEl.textContent = tilesApplied === 0 ? 'refused — check the viewer token' : 'disconnected';
 };
+// This viewer's own lease session, learned when it acquires. The gateway names
+// the holder by session, so this is how the tab tells "I am operating" from
+// "someone else is".
+let mySession = null;
+let iOperate = false;
+
+const leaseEl = document.getElementById('lease');
+const opBtn = document.getElementById('opBtn');
+const relBtn = document.getElementById('relBtn');
+
+opBtn.onclick = () => { acquirePending = true; send({ type: 'acquire' }); };
+relBtn.onclick = () => send({ type: 'release' });
+
+function renderLease(holder, session) {
+  iOperate = holder === 'human' && session === mySession && mySession !== null;
+  leaseEl.classList.remove('you', 'agent', 'other');
+  if (iOperate) {
+    leaseEl.textContent = 'you are operating';
+    leaseEl.classList.add('you');
+    opBtn.hidden = true; relBtn.hidden = false;
+  } else if (holder === 'agent') {
+    leaseEl.textContent = 'the agent is operating';
+    leaseEl.classList.add('agent');
+    opBtn.hidden = false; relBtn.hidden = true;
+    opBtn.textContent = 'Take control'; // §5.6: a human may preempt an agent
+    opBtn.disabled = false;
+  } else if (holder === 'human') {
+    leaseEl.textContent = 'another person is operating';
+    leaseEl.classList.add('other');
+    // §5.6 forbids one human preempting another — the button is disabled, not
+    // hidden, so the state is legible rather than mysterious.
+    opBtn.hidden = false; relBtn.hidden = true; opBtn.disabled = true;
+    opBtn.textContent = 'In use';
+  } else {
+    leaseEl.textContent = 'nobody is operating';
+    opBtn.hidden = false; relBtn.hidden = true;
+    opBtn.textContent = 'Take control'; opBtn.disabled = false;
+  }
+}
+
 ws.onmessage = async (ev) => {
   if (typeof ev.data === 'string') {
-    // The gateway tells us we fell behind and lost updates; the canvas now has
-    // holes, so ask for a full frame instead of applying the next diff onto it.
-    if (JSON.parse(ev.data).type === 'lagged') send({ type: 'keyframe' });
+    const m = JSON.parse(ev.data);
+    if (m.type === 'lagged') { send({ type: 'keyframe' }); return; }
+    if (m.type === 'control') {
+      // If we just asked and a human now holds it, that human is us.
+      if (acquirePending && m.holder === 'human') { mySession = m.session; acquirePending = false; }
+      renderLease(m.holder, m.session);
+      return;
+    }
+    if (m.type === 'denied') {
+      if (m.reason === 'held') {
+        statEl.textContent = `held by the ${m.holder}; retry in ${m.retry_after_sec}s`;
+      } else if (m.reason === 'read_only') {
+        statEl.textContent = 'this viewer is read-only';
+      }
+      return;
+    }
     return;
   }
   await applyUpdate(new DataView(ev.data));
 };
+
+// The gateway does not tell us our own session id, so we learn it the moment an
+// acquire succeeds: the next control message naming a human holder that was not
+// there before is us. Simpler and race-free: tag our acquire and treat the
+// first human-held control that follows as ours.
+let acquirePending = false;
+const origSend = null;
 
 async function applyUpdate(dv) {
   const seq = dv.getUint32(0);

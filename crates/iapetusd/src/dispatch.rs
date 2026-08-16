@@ -175,6 +175,14 @@ impl Dispatcher {
         self.frames.capture_now(None)
     }
 
+    /// Releases every held key and pointer button (§5.6 handover).
+    ///
+    /// Called when the control lease changes hands, so the incoming holder
+    /// starts from a clean input state rather than inheriting a chord.
+    pub fn release_all(&self) -> crate::platform::Result<()> {
+        self.input.release_all()
+    }
+
     /// Blocks until the screen changes or `timeout` elapses.
     ///
     /// Backed by XDamage. This is what lets the stream idle instead of

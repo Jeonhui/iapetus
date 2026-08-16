@@ -9,6 +9,7 @@
 //! drift between them.
 
 pub mod id;
+pub mod lease;
 pub mod limits;
 
 /// Types generated from `proto/iapetus/v1/*.proto`.

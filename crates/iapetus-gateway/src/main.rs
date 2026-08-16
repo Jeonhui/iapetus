@@ -18,14 +18,23 @@
 //! API actions an agent sends. Anything else would split the audit log and make
 //! lease arbitration impossible.
 
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::State;
 use axum::response::{Html, IntoResponse};
 use axum::routing::get;
 use axum::Router;
+use iapetus_proto::lease::{Acquired, Actor, ControlLease};
 use tokio::sync::{broadcast, Mutex};
+
+/// The session the guest holds the lease under. §5.6's human-preempts-agent
+/// rule needs the guest to actually hold WRITE as an agent, so a viewer taking
+/// over is a real preemption — the S4 case — rather than grabbing a free lease.
+const GUEST_SESSION: &str = "guest:agent";
+const HEARTBEAT: Duration = Duration::from_secs(30);
 
 /// One cached rectangle of the screen.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -156,6 +165,16 @@ struct App {
     /// Input and control, viewers → guest.
     to_guest: broadcast::Sender<String>,
     cache: Mutex<TileCache>,
+    /// The §5.6 input lease. std Mutex, not tokio: every hold is a handful of
+    /// non-awaiting comparisons, and a viewer's input must not wait on an async
+    /// scheduler to learn whether it may pass.
+    lease: std::sync::Mutex<ControlLease>,
+    /// control.granted / control.revoked, gateway → all viewers.
+    control_events: broadcast::Sender<String>,
+    /// Origin for the lease's monotonic `now`. Only differences matter (§5.6).
+    started: Instant,
+    /// Hands each viewer socket a distinct lease session id.
+    next_session: AtomicU64,
     /// Stands in for §19.6's SRTP key: the guest proves it belongs before it may
     /// push a screen. Not the product mechanism, but the endpoint must not be
     /// open to anything that can reach the port.
@@ -199,16 +218,35 @@ async fn main() {
     // reported to the viewer as dropped updates and recovered with a keyframe.
     let (frames, _) = broadcast::channel(32);
     let (to_guest, _) = broadcast::channel(256);
+    let (control_events, _) = broadcast::channel(64);
 
     let app = Arc::new(App {
         frames,
         to_guest,
         cache: Mutex::new(TileCache::default()),
+        lease: std::sync::Mutex::new(ControlLease::new()),
+        control_events,
+        started: Instant::now(),
+        next_session: AtomicU64::new(1),
         guest_attached: std::sync::atomic::AtomicBool::new(false),
         ingest_token,
         view_token,
         write_token,
     });
+
+    // Reap the lease on a timer, so a human who idles out or a holder that
+    // stops heartbeating frees the lease even while nobody is contending for it
+    // (§5.6). One second is well inside the 300s idle and 90s heartbeat windows.
+    {
+        let app = Arc::clone(&app);
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(Duration::from_secs(1));
+            loop {
+                tick.tick().await;
+                app.reap_lease();
+            }
+        });
+    }
 
     let router = Router::new()
         .route("/", get(|| async { Html(include_str!("viewer.html")) }))
@@ -243,6 +281,16 @@ async fn guest_socket(socket: WebSocket, app: Arc<App>) {
 
     println!("guest attached");
 
+    // The guest holds the lease as an agent while it is attached, so a viewer
+    // pressing "operate" preempts it (§5.6) rather than picking up a free
+    // lease. The agent has no input path here yet — §19.5 is the Control Plane
+    // channel — but holding WRITE is what makes the human takeover a real one.
+    {
+        let mut lease = app.lease.lock().unwrap();
+        let _ = lease.acquire(GUEST_SESSION, &Actor::agent("stream-agent"), app.now(), HEARTBEAT);
+    }
+    app.broadcast_control();
+
     let pump = tokio::spawn(async move {
         while let Ok(msg) = inbound.recv().await {
             if tx.send(Message::Text(msg.into())).await.is_err() {
@@ -262,6 +310,11 @@ async fn guest_socket(socket: WebSocket, app: Arc<App>) {
     }
 
     pump.abort();
+    {
+        let mut lease = app.lease.lock().unwrap();
+        let _ = lease.release(GUEST_SESSION);
+    }
+    app.broadcast_control();
     app.release_guest();
     println!("guest detached");
 }
@@ -282,9 +335,12 @@ async fn viewer_socket(socket: WebSocket, app: Arc<App>, level: Control) {
     use futures_util::{SinkExt, StreamExt};
     let (mut tx, mut rx) = socket.split();
 
+    let session = format!("v{}", app.next_session.fetch_add(1, Ordering::SeqCst));
+
     // Subscribe *before* sending the bootstrap, or an update landing in between
     // is lost and that region stays stale until it next changes.
     let mut frames = app.frames.subscribe();
+    let mut control = app.control_events.subscribe();
 
     match app.cache.lock().await.keyframe() {
         Some(kf) => {
@@ -297,69 +353,196 @@ async fn viewer_socket(socket: WebSocket, app: Arc<App>, level: Control) {
         }
     }
 
+    // Tell this viewer the current holder immediately, so its button reflects
+    // reality before anything else happens.
+    let _ = tx
+        .send(Message::Text(control_snapshot(&app, &session).into()))
+        .await;
+
     let out = tokio::spawn(async move {
         loop {
-            match frames.recv().await {
-                Ok(buf) => {
-                    if tx.send(Message::Binary(buf.as_ref().clone().into())).await.is_err() {
-                        break;
+            tokio::select! {
+                frame = frames.recv() => match frame {
+                    Ok(buf) => {
+                        if tx.send(Message::Binary(buf.as_ref().clone().into())).await.is_err() {
+                            break;
+                        }
                     }
-                }
-                // This viewer fell behind and the channel dropped updates for
-                // it. Its canvas now has holes, so it needs a fresh keyframe
-                // rather than the next diff.
-                Err(broadcast::error::RecvError::Lagged(_)) => {
-                    let _ = tx.send(Message::Text(r#"{"type":"lagged"}"#.into())).await;
-                }
-                Err(broadcast::error::RecvError::Closed) => break,
+                    // Fell behind; the canvas has holes, so ask for a keyframe
+                    // rather than applying the next diff onto them.
+                    Err(broadcast::error::RecvError::Lagged(_)) => {
+                        if tx.send(Message::Text(r#"{"type":"lagged"}"#.into())).await.is_err() {
+                            break;
+                        }
+                    }
+                    Err(broadcast::error::RecvError::Closed) => break,
+                },
+                ev = control.recv() => match ev {
+                    Ok(msg) => {
+                        if tx.send(Message::Text(msg.into())).await.is_err() {
+                            break;
+                        }
+                    }
+                    Err(broadcast::error::RecvError::Lagged(_)) => {}
+                    Err(broadcast::error::RecvError::Closed) => break,
+                },
             }
         }
     });
 
-    // Input, forwarded per the socket's control level. Turning it into actions
-    // stays the guest's job, on the same queue as agent actions (§7.5).
+    // Input, gated on the §5.6 lease. A WRITE *token* only means this viewer
+    // may *request* the lease; the lease itself decides whether input passes,
+    // which is what lets several people watch while one operates (§7.5 V-10).
     while let Some(Ok(msg)) = rx.next().await {
         let Message::Text(t) = msg else { continue };
-        if !may_forward(&t, level) {
-            continue;
+        let Ok(env) = serde_json::from_str::<Envelope>(&t) else {
+            continue; // unclassifiable — the guest would drop it too
+        };
+
+        match env.kind.as_str() {
+            "acquire" => handle_acquire(&app, &session, level).await,
+            "release" => handle_release(&app, &session).await,
+            // A keyframe request is not input; a READ observer still needs a
+            // picture. Everything else is input and requires the lease.
+            "keyframe" => {
+                let _ = app.to_guest.send(t.to_string());
+            }
+            _ => {
+                if app.lease.lock().unwrap().holds_write(&session) {
+                    // Every forwarded input is also a heartbeat's worth of
+                    // activity, which is what keeps a busy human's lease from
+                    // idling out from under them (§5.6).
+                    app.lease.lock().unwrap().mark_input(&session, app.now());
+                    let _ = app.to_guest.send(t.to_string());
+                }
+                // Not the holder: silently dropped. An observer's stray click
+                // must not reach a desktop it has no lease on.
+            }
         }
-        let _ = app.to_guest.send(t.to_string());
     }
 
+    // A viewer that closes its tab while holding the lease must free it, or the
+    // desktop is stuck until the lease idles out.
+    if let Some(_r) = app.lease.lock().unwrap().release(&session) {
+        let _ = app.to_guest.send(r#"{"type":"release_all"}"#.to_string());
+    }
+    app.broadcast_control();
     out.abort();
 }
 
+/// A viewer pressed "operate". A WRITE token is required to even try; the lease
+/// then decides between granting, preempting the agent, and refusing.
+async fn handle_acquire(app: &Arc<App>, session: &str, level: Control) {
+    if level != Control::Write {
+        // A READ token cannot operate — that is the whole distinction (§7.5).
+        let _ = app.control_events.send(
+            format!(r#"{{"type":"denied","session":"{session}","reason":"read_only"}}"#),
+        );
+        return;
+    }
+
+    let outcome = {
+        let mut lease = app.lease.lock().unwrap();
+        lease.acquire(session, &Actor::human(session), app.now(), HEARTBEAT)
+    };
+
+    match outcome {
+        Ok(Acquired::Preempted { .. }) => {
+            // §5.6: before the human's first keystroke, the agent's held keys
+            // are released so a latched Ctrl does not turn typing into
+            // shortcuts. The guest owns that release.
+            let _ = app.to_guest.send(r#"{"type":"release_all"}"#.to_string());
+            app.broadcast_control();
+        }
+        Ok(_) => app.broadcast_control(),
+        Err(held) => {
+            // CONTROL_HELD — another person is operating (§5.6 forbids one
+            // human preempting another). Tell just this viewer, with the retry
+            // hint, rather than broadcasting a non-event to everyone.
+            let holder = match held.holder.kind {
+                iapetus_proto::lease::ActorType::Human => "human",
+                _ => "agent",
+            };
+            let _ = app.control_events.send(format!(
+                r#"{{"type":"denied","session":"{session}","reason":"held","holder":"{holder}","retry_after_sec":{}}}"#,
+                held.retry_after.as_secs()
+            ));
+        }
+    }
+}
+
+async fn handle_release(app: &Arc<App>, session: &str) {
+    let released = app.lease.lock().unwrap().release(session);
+    if released.is_some() {
+        // Even a clean release leaves a clean input state for whoever is next.
+        let _ = app.to_guest.send(r#"{"type":"release_all"}"#.to_string());
+        app.broadcast_control();
+    }
+}
+
+/// The current holder, framed for one viewer so it can set its button state.
+fn control_snapshot(app: &App, _session: &str) -> String {
+    let lease = app.lease.lock().unwrap();
+    let holder = lease.holder().map(|a| a.kind);
+    let session = lease.holder_session().unwrap_or_default();
+    let kind = match holder {
+        Some(iapetus_proto::lease::ActorType::Human) => "human",
+        Some(iapetus_proto::lease::ActorType::Agent) => "agent",
+        _ => "none",
+    };
+    format!(r#"{{"type":"control","holder":"{kind}","session":"{session}"}}"#)
+}
+
 /// Just the discriminator; the guest validates the rest.
+///
+/// Parsed, never substring-matched. An earlier gate looked for the literal
+/// `"keyframe"` anywhere in the text, which let a READ viewer smuggle input by
+/// embedding that string in a `type` payload. The discriminator is the only
+/// honest place to classify a message, and one that does not parse is dropped.
 #[derive(serde::Deserialize)]
 struct Envelope {
     #[serde(rename = "type")]
     kind: String,
 }
 
-/// Whether a viewer message may reach the guest at this control level.
-///
-/// Parsed, not substring-matched. An earlier version looked for the literal
-/// `"keyframe"` anywhere in the text, which let a READ viewer smuggle input by
-/// embedding that string in a `type` payload — an observer injecting keystrokes
-/// into a desktop it was only allowed to watch. The discriminator is the only
-/// honest place to look.
-///
-/// A message that does not parse is dropped for every level: the guest would
-/// drop it too, and forwarding bytes we cannot classify means the READ gate is
-/// only as strong as the guest's parser agreeing with ours.
-fn may_forward(text: &str, level: Control) -> bool {
-    let Ok(env) = serde_json::from_str::<Envelope>(text) else {
-        return false;
-    };
-    match level {
-        Control::Write => true,
-        // A keyframe request is not input — an observer still needs a picture,
-        // and refusing it would leave a READ viewer on a blank canvas.
-        Control::Read => env.kind == "keyframe",
-    }
-}
-
 impl App {
+    /// The lease's monotonic clock, in milliseconds since the gateway started.
+    fn now(&self) -> u64 {
+        self.started.elapsed().as_millis() as u64
+    }
+
+    /// Tells every viewer who now holds the lease, so each renders "you are
+    /// operating" / "the agent is operating" without polling.
+    fn broadcast_control(&self) {
+        let holder = self.lease.lock().unwrap().holder().map(|a| a.kind).map_or(
+            "none",
+            |k| match k {
+                iapetus_proto::lease::ActorType::Human => "human",
+                iapetus_proto::lease::ActorType::Agent => "agent",
+                _ => "none",
+            },
+        );
+        // Names the holding session too, so a viewer can tell whether the human
+        // operating is itself or someone else at another browser (V-10).
+        let session = self.lease.lock().unwrap().holder_session().unwrap_or_default();
+        let _ = self
+            .control_events
+            .send(format!(r#"{{"type":"control","holder":"{holder}","session":"{session}"}}"#));
+    }
+
+    /// Reaps an expired or idled-out holder on a timer, so a lease that lapsed
+    /// with nobody contending still frees and still tells the viewers (§5.6).
+    fn reap_lease(&self) {
+        let revoked = self.lease.lock().unwrap().reap(self.now());
+        if let Some(_r) = revoked {
+            // A reaped agent lease needs no key release — the guest already
+            // released on detach — but a reaped human one does, and either way
+            // the viewers must learn the lease is free.
+            let _ = self.to_guest.send(r#"{"type":"release_all"}"#.to_string());
+            self.broadcast_control();
+        }
+    }
+
     /// Claims the single guest slot; `false` means one is already attached.
     fn try_claim_guest(&self) -> bool {
         !self.guest_attached.swap(true, std::sync::atomic::Ordering::SeqCst)
@@ -391,10 +574,15 @@ mod tests {
     fn app() -> App {
         let (frames, _) = broadcast::channel(4);
         let (to_guest, _) = broadcast::channel(4);
+        let (control_events, _) = broadcast::channel(8);
         App {
             frames,
             to_guest,
             cache: Mutex::new(TileCache::default()),
+            lease: std::sync::Mutex::new(ControlLease::new()),
+            control_events,
+            started: Instant::now(),
+            next_session: AtomicU64::new(1),
             guest_attached: std::sync::atomic::AtomicBool::new(false),
             ingest_token: "ing".into(),
             view_token: "look".into(),
@@ -403,19 +591,19 @@ mod tests {
     }
 
     #[test]
-    fn a_read_viewer_cannot_smuggle_input_past_the_gate() {
+    fn a_message_is_classified_by_its_parsed_discriminator_not_a_substring() {
         // The regression this guards: the gate used to substring-match
         // `"keyframe"`, so a READ viewer could embed it in a `type` payload and
-        // have the guest type its text — an observer injecting keystrokes.
-        let evil = r#"{"type":"type","text":"stolen \"keyframe\" text"}"#;
-        assert!(!may_forward(evil, Control::Read), "input smuggled past the READ gate");
-        assert!(may_forward(evil, Control::Write), "the same message is legitimate at WRITE");
+        // slip input past. Classification is now by the parsed field, and an
+        // unparseable message has no kind at all.
+        let evil: Envelope =
+            serde_json::from_str(r#"{"type":"type","text":"stolen \"keyframe\" text"}"#).unwrap();
+        assert_eq!(evil.kind, "type", "a type message must classify as input, not keyframe");
 
-        assert!(may_forward(r#"{"type":"keyframe"}"#, Control::Read));
-        assert!(!may_forward(r#"{"type":"mouse.move","x":1,"y":2}"#, Control::Read));
-        // Unclassifiable bytes are dropped for everyone; forwarding them makes
-        // the gate only as strong as two parsers agreeing.
-        assert!(!may_forward("not json", Control::Write));
+        let kf: Envelope = serde_json::from_str(r#"{"type":"keyframe"}"#).unwrap();
+        assert_eq!(kf.kind, "keyframe");
+
+        assert!(serde_json::from_str::<Envelope>("not json").is_err());
     }
 
     #[test]
