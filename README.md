@@ -58,6 +58,28 @@ curl -s -X POST http://localhost:8090/v1/tokens \
        "actor":{"type":"human","id":"you"},"control":"write"}'
 ```
 
+## Without Docker
+
+Docker is a convenience, not a requirement — it is the easiest way to get a
+Linux desktop environment, nothing more.
+
+- **Using the SDK** needs no Docker at all. It is pure Python/TypeScript over
+  HTTP; point it at a desktop running anywhere — a remote host, a colleague's
+  machine, the cloud.
+- **The gateway and control plane** are cross-platform Rust binaries. `cargo run`
+  starts them on macOS, Windows, or Linux with no container.
+- **The desktop** (`iapetusd`) needs an X server and a browser, so it needs a
+  Linux environment. On Linux that is native:
+
+  ```bash
+  sudo apt-get install -y xvfb openbox chromium
+  scripts/run-native.sh          # builds and starts the whole stack, no Docker
+  ```
+
+  On macOS or Windows the desktop is the one part that still needs Linux, which
+  Docker (or a remote Linux host) provides — the services and SDK run natively
+  alongside it.
+
 ## What is in the box
 
 Three services, one image, wired together by `docker-compose.yml`:
