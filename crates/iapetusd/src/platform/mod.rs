@@ -140,7 +140,22 @@ pub struct LaunchSpec {
     pub elevated: bool,
 }
 
-/// Starting programs.
+/// The outcome of a synchronous `shell.exec`.
+#[derive(Debug, Clone)]
+pub struct ShellOutput {
+    pub exit_code: i32,
+    pub stdout: Vec<u8>,
+    pub stderr: Vec<u8>,
+    /// Either stream hit the cap and was cut. §8.2 truncates rather than
+    /// streaming here; `shell.stream` is the unbounded path.
+    pub truncated: bool,
+    /// The deadline elapsed and the process was killed. `exit_code` is then the
+    /// signal-based code, and the agent needs to know the difference between
+    /// "exited non-zero" and "we stopped waiting".
+    pub timed_out: bool,
+}
+
+/// Starting programs and running commands.
 pub trait Process: Send + Sync {
     /// Spawns and returns immediately with the child's pid.
     ///
@@ -148,6 +163,14 @@ pub trait Process: Send + Sync {
     /// `wait_for_window` is the caller's way of asking to block on something
     /// that actually happens.
     fn launch(&self, spec: &LaunchSpec) -> Result<u32>;
+
+    /// Runs a command through a shell and waits for it, capturing output.
+    ///
+    /// Synchronous by §7.2. Output is captured, capped, and truncated rather
+    /// than streamed — an agent calling `shell.exec` asked for the result, not
+    /// a live feed, and an uncapped capture lets a runaway `yes` exhaust the
+    /// daemon's memory.
+    fn run(&self, spec: &LaunchSpec, timeout: Duration, cap: usize) -> Result<ShellOutput>;
 }
 
 /// Querying and waiting on windows.

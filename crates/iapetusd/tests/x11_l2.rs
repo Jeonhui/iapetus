@@ -18,7 +18,8 @@
 use std::time::Duration;
 
 use iapetusd::platform::x11::{X11Display, X11Input};
-use iapetusd::platform::{Button, Display, Input, Rect};
+use iapetusd::platform::{Button, Display, Input, LaunchSpec, Process, Rect};
+use iapetusd::platform::unix::UnixProcess;
 
 use x11rb::connection::Connection;
 use x11rb::protocol::xproto::{
@@ -439,4 +440,73 @@ fn a_quiet_screen_reports_no_change_and_a_real_one_does() {
         display.wait_for_change(Duration::from_millis(200)).unwrap_or(false)
     });
     assert!(noticed, "drawing into a window produced no damage — the stream would freeze");
+}
+
+// shell.exec runs through the real /bin/sh; these do not need a display, but
+// live beside the L2 suite because they exercise the platform boundary against
+// the real OS rather than the fake backend.
+
+#[test]
+fn shell_exec_captures_stdout_and_the_exit_code() {
+    let p = UnixProcess::new();
+    let spec = LaunchSpec {
+        command: "echo hello && exit 3".into(),
+        args: vec![],
+        cwd: None,
+        elevated: false,
+    };
+    let out = p.run(&spec, Duration::from_secs(5), 1024 * 1024).expect("run");
+    assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "hello");
+    assert_eq!(out.exit_code, 3, "the command's own exit code was lost");
+    assert!(!out.timed_out);
+}
+
+#[test]
+fn shell_exec_uses_a_shell_so_pipes_and_redirection_work() {
+    // §7.2's shell.exec takes a command line, not an argv. If it ran the string
+    // as a single program, a pipe would be a filename and this would fail.
+    let p = UnixProcess::new();
+    let spec = LaunchSpec {
+        command: "printf 'a\nb\nc\n' | wc -l".into(),
+        args: vec![],
+        cwd: None,
+        elevated: false,
+    };
+    let out = p.run(&spec, Duration::from_secs(5), 1024 * 1024).expect("run");
+    assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "3");
+}
+
+#[test]
+fn shell_exec_times_out_a_runaway_rather_than_hanging() {
+    // Without the deadline a `sleep 100` would hold the action queue for its
+    // whole duration. The timeout must report itself as such, not as a wild
+    // exit code, so the agent can tell "stopped" from "failed".
+    let p = UnixProcess::new();
+    let spec = LaunchSpec {
+        command: "sleep 30".into(),
+        args: vec![],
+        cwd: None,
+        elevated: false,
+    };
+    let start = std::time::Instant::now();
+    let out = p.run(&spec, Duration::from_millis(300), 1024 * 1024).expect("run");
+    assert!(start.elapsed() < Duration::from_secs(5), "the timeout did not fire");
+    assert!(out.timed_out, "a killed process was not reported as timed out");
+    assert_eq!(out.exit_code, 124);
+}
+
+#[test]
+fn shell_exec_truncates_a_flood_and_says_so() {
+    // An uncapped capture lets a runaway `yes` exhaust the daemon's memory.
+    let p = UnixProcess::new();
+    let spec = LaunchSpec {
+        command: "yes AAAAAAAA | head -c 5000000".into(),
+        args: vec![],
+        cwd: None,
+        elevated: false,
+    };
+    let cap = 64 * 1024;
+    let out = p.run(&spec, Duration::from_secs(10), cap).expect("run");
+    assert!(out.truncated, "5MB of output through a 64KB cap was not marked truncated");
+    assert!(out.stdout.len() <= cap, "output {} exceeded the cap {cap}", out.stdout.len());
 }

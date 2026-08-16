@@ -352,7 +352,39 @@ impl Dispatcher {
                 }))
             }
             Kind::AppInstall(_) => return Err(DispatchError::NotImplemented("app.install")),
-            Kind::ShellExec(_) => return Err(DispatchError::NotImplemented("shell.exec")),
+            Kind::ShellExec(req) => {
+                let process = self.process.as_ref().ok_or(DispatchError::NoDriver("shell.exec"))?;
+                // §8.2: default 30s, clamped to the 300s ceiling. A zero from an
+                // unset proto field takes the default rather than timing out at
+                // once, the same rule the deadline path follows.
+                let (default_ms, max_ms) = limits::TIMEOUT_SHELL_MS;
+                let ms = match req.timeout_ms {
+                    0 => default_ms,
+                    n if n < 0 => default_ms,
+                    n => (n as u32).min(max_ms),
+                };
+                let spec = LaunchSpec {
+                    command: req.command.clone(),
+                    args: Vec::new(),
+                    cwd: req.cwd.clone(),
+                    elevated: req.elevated.unwrap_or(false),
+                };
+                let out = process.run(
+                    &spec,
+                    Duration::from_millis(u64::from(ms)),
+                    limits::SHELL_OUTPUT_MAX_BYTES,
+                )?;
+                // A shell command changes the screen as readily as a click —
+                // a dialog, a window — so §6.3 must anchor a later screenshot
+                // to it too.
+                self.mark_input();
+                Some(v1::action_result::Value::Shell(v1::ShellResult {
+                    exit_code: out.exit_code,
+                    stdout: String::from_utf8_lossy(&out.stdout).into_owned(),
+                    stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
+                    truncated: out.truncated,
+                }))
+            }
             Kind::WaitFor(_) => return Err(DispatchError::NotImplemented("wait_for")),
         };
 
@@ -723,6 +755,43 @@ mod tests {
             wait_for_window: None,
         }));
         assert!(d.execute(&a).is_err());
+    }
+
+    #[test]
+    fn shell_exec_returns_output_and_applies_the_output_cap() {
+        let (d, _) = app_dispatcher();
+        let a = launch_action(Kind::ShellExec(v1::ShellExec {
+            command: "echo hi".into(),
+            cwd: None,
+            env: Default::default(),
+            elevated: None,
+            timeout_ms: 0,
+        }));
+        let r = d.execute(&a).expect("shell.exec failed");
+        let Some(v1::action_result::Value::Shell(res)) = r.value else {
+            panic!("no shell result");
+        };
+        assert_eq!(res.exit_code, 0);
+        assert_eq!(res.stdout, "echo hi"); // the fake echoes the command
+        assert!(!res.truncated);
+    }
+
+    #[test]
+    fn shell_exec_without_a_process_driver_fails_loudly() {
+        // A silent success would tell an agent a command ran when nothing did —
+        // it would then act on output that never existed.
+        let d = Dispatcher::new(
+            FrameSource::new(Box::new(FakeDisplay::new(64, 48))),
+            Box::new(FakeInput::new()),
+        );
+        let a = launch_action(Kind::ShellExec(v1::ShellExec {
+            command: "true".into(),
+            cwd: None,
+            env: Default::default(),
+            elevated: None,
+            timeout_ms: 0,
+        }));
+        assert!(matches!(d.execute(&a).unwrap_err(), DispatchError::NoDriver("shell.exec")));
     }
 
     #[test]

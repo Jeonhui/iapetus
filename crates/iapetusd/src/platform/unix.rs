@@ -5,9 +5,13 @@
 //! program launched by an agent must outlive the action that started it, and
 //! must not become a zombie the daemon never reaps.
 
+use std::os::unix::process::CommandExt as _;
 use std::process::{Command, Stdio};
 
-use super::{LaunchSpec, PlatformError, Process, Result};
+use std::io::Read;
+use std::time::{Duration, Instant};
+
+use super::{LaunchSpec, PlatformError, Process, Result, ShellOutput};
 
 pub struct UnixProcess;
 
@@ -66,6 +70,138 @@ impl Process for UnixProcess {
 
         Ok(pid)
     }
+
+    fn run(&self, spec: &LaunchSpec, timeout: Duration, cap: usize) -> Result<ShellOutput> {
+        if spec.command.trim().is_empty() {
+            return Err(PlatformError::InputRejected("no command to run".into()));
+        }
+
+        // Through `sh -c`, because §7.2's `shell.exec` takes a command line —
+        // pipes, redirections, and `&&` — not an argv. `app.launch` is the argv
+        // path; conflating them would make one of the two surprising.
+        let mut cmd = if spec.elevated {
+            let mut c = Command::new("sudo");
+            c.arg("-n").arg("--").arg("sh").arg("-c").arg(&spec.command);
+            c
+        } else {
+            let mut c = Command::new("sh");
+            c.arg("-c").arg(&spec.command);
+            c
+        };
+        if let Some(dir) = &spec.cwd {
+            cmd.current_dir(dir);
+        }
+        cmd.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
+
+        // Put the shell in its own process group. `sh -c "sleep 30"` forks the
+        // sleep, and killing only the shell would leave the sleep holding the
+        // stdout pipe open — the reader never sees EOF and the whole thing hangs
+        // past its deadline. Killing the group takes the children too.
+        //
+        // SAFETY: setsid in the child before exec sets no shared state and only
+        // detaches the new process into its own session and group.
+        unsafe {
+            cmd.pre_exec(|| {
+                if libc::setsid() == -1 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+
+        let mut child = cmd
+            .spawn()
+            .map_err(|e| PlatformError::InputRejected(format!("could not run {}: {e}", spec.command)))?;
+
+        // Read the pipes on threads so a program that fills stderr while we wait
+        // on stdout cannot deadlock against a full pipe buffer.
+        let mut out = child.stdout.take().map(reader_thread);
+        let mut err = child.stderr.take().map(reader_thread);
+
+        let deadline = Instant::now() + timeout;
+        let mut timed_out = false;
+        loop {
+            match child.try_wait() {
+                Ok(Some(_)) => break,
+                Ok(None) => {
+                    if Instant::now() >= deadline {
+                        // Signal the whole group (negative pid), so the forked
+                        // children die with the shell rather than orphaning and
+                        // keeping the pipes open.
+                        //
+                        // SAFETY: a kill with a signal number and a pid; the pid
+                        // is this child's, still live because we have not reaped
+                        // it. setsid above made its pid the group id.
+                        unsafe {
+                            libc::kill(-(child.id() as i32), libc::SIGKILL);
+                        }
+                        let _ = child.wait();
+                        timed_out = true;
+                        break;
+                    }
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                Err(e) => return Err(PlatformError::CaptureFailed(format!("waiting on the child: {e}"))),
+            }
+        }
+
+        let status = child.wait().ok();
+        let (mut stdout, t1) = out.take().map(|h| h.join().unwrap_or_default()).unwrap_or_default();
+        let (mut stderr, t2) = err.take().map(|h| h.join().unwrap_or_default()).unwrap_or_default();
+
+        let mut truncated = t1 || t2;
+        if stdout.len() > cap {
+            stdout.truncate(cap);
+            truncated = true;
+        }
+        if stderr.len() > cap {
+            stderr.truncate(cap);
+            truncated = true;
+        }
+
+        // On a timeout the exit status is the SIGKILL we sent, which is not the
+        // program's own. Reporting 124 — the timeout(1) convention — tells the
+        // agent it was stopped rather than that it failed with a wild code.
+        let exit_code = if timed_out {
+            124
+        } else {
+            status.and_then(|s| s.code()).unwrap_or(-1)
+        };
+
+        Ok(ShellOutput { exit_code, stdout, stderr, truncated, timed_out })
+    }
+}
+
+/// Reads a pipe to EOF on its own thread, stopping the capture once it is
+/// hopelessly large so a runaway process cannot exhaust memory before the
+/// caller's own cap is applied. Returns the bytes and whether it was cut.
+fn reader_thread<R: Read + Send + 'static>(
+    mut r: R,
+) -> std::thread::JoinHandle<(Vec<u8>, bool)> {
+    // A generous ceiling well above §8.2's 1MB cap: the caller truncates to the
+    // real limit, and this only stops a `yes`-style flood from growing without
+    // bound while it waits.
+    const HARD_CEIL: usize = 16 * 1024 * 1024;
+    std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        let mut chunk = [0u8; 64 * 1024];
+        loop {
+            match r.read(&mut chunk) {
+                Ok(0) => break,
+                Ok(n) => {
+                    if buf.len() < HARD_CEIL {
+                        buf.extend_from_slice(&chunk[..n.min(HARD_CEIL - buf.len())]);
+                    } else {
+                        // Keep draining so the child does not block on a full
+                        // pipe, but stop growing the buffer.
+                        return (buf, true);
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+        (buf, false)
+    })
 }
 
 #[cfg(test)]

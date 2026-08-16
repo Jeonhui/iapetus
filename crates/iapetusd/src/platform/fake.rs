@@ -10,7 +10,7 @@ use std::time::{Duration, SystemTime};
 
 use super::{
     Button, Display, Frame, Input, LaunchSpec, PixelFormat, PlatformError, Process, Rect, Result,
-    ScreenInfo, WindowInfo, Windows,
+    ScreenInfo, ShellOutput, WindowInfo, Windows,
 };
 
 /// A record of what was asked of the input driver, so tests can assert on it.
@@ -298,11 +298,30 @@ impl Process for FakeProcess {
         self.launched.lock().unwrap().push(spec.clone());
         Ok(self.next_pid.fetch_add(1, Ordering::SeqCst))
     }
+
+    fn run(&self, spec: &LaunchSpec, _timeout: Duration, cap: usize) -> Result<ShellOutput> {
+        if self.missing.lock().unwrap().iter().any(|c| c == &spec.command) {
+            return Err(PlatformError::InputRejected(format!("no such program: {}", spec.command)));
+        }
+        self.launched.lock().unwrap().push(spec.clone());
+        // Echoes the command back as stdout, so a dispatch test can assert the
+        // output round-tripped and the cap was applied without a real shell.
+        let mut stdout = spec.command.clone().into_bytes();
+        let mut truncated = false;
+        if stdout.len() > cap {
+            stdout.truncate(cap);
+            truncated = true;
+        }
+        Ok(ShellOutput { exit_code: 0, stdout, stderr: Vec::new(), truncated, timed_out: false })
+    }
 }
 
 impl Process for std::sync::Arc<FakeProcess> {
     fn launch(&self, spec: &LaunchSpec) -> Result<u32> {
         (**self).launch(spec)
+    }
+    fn run(&self, spec: &LaunchSpec, timeout: Duration, cap: usize) -> Result<ShellOutput> {
+        (**self).run(spec, timeout, cap)
     }
 }
 
