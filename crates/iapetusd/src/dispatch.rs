@@ -20,6 +20,7 @@ use iapetus_proto::v1::{self, action::Kind};
 
 use crate::catalog::Catalog;
 use crate::frame::FrameSource;
+use crate::secret::SecretResolver;
 use crate::platform::{Button, Input, LaunchSpec, PlatformError, Process, Rect, Windows};
 
 #[derive(Debug, thiserror::Error)]
@@ -36,6 +37,9 @@ pub enum DispatchError {
     NotImplemented(&'static str),
     #[error("no driver for {0} on this build")]
     NoDriver(&'static str),
+    /// Names the ref, never the value (§9.3).
+    #[error("secret `{0}`: {1}")]
+    Secret(String, crate::secret::SecretError),
     #[error("no catalog entry for `{0}`; launch it by command instead (§5.5)")]
     UnknownAppKey(String),
     #[error("package manager `{0}` is not available on this OS")]
@@ -57,6 +61,7 @@ impl DispatchError {
             DispatchError::BatchTooLarge { .. } => "BATCH_TOO_LARGE",
             DispatchError::TextTooLong { .. } => "PAYLOAD_TOO_LARGE",
             DispatchError::NotImplemented(_) | DispatchError::NoDriver(_) => "UNSUPPORTED_ON_OS",
+            DispatchError::Secret(_, _) => "EXEC_FAILED",
             // Not APP_NOT_ALLOWED: §5.5 makes the catalog a shortcut, not a
             // restriction, and §8.9 reserves that code for `restricted` mode.
             // Reporting an authority failure for a missing shortcut would send
@@ -136,6 +141,7 @@ pub struct Dispatcher {
     input: Box<dyn Input>,
     process: Option<Box<dyn Process>>,
     windows: Option<Box<dyn Windows>>,
+    secrets: Option<Box<dyn SecretResolver>>,
     catalog: Catalog,
     /// When the most recent input action finished. A screenshot must not return
     /// a frame captured before this (§6.3).
@@ -157,6 +163,7 @@ impl Dispatcher {
             input,
             process: None,
             windows: None,
+            secrets: None,
             catalog: Catalog::empty(),
             last_input_at: std::sync::Mutex::new(None),
             clock_offset_ms: std::sync::atomic::AtomicI64::new(0),
@@ -174,6 +181,15 @@ impl Dispatcher {
     #[must_use]
     pub fn with_windows(mut self, w: Box<dyn Windows>) -> Self {
         self.windows = Some(w);
+        self
+    }
+
+    /// Adds the secret resolver. Without one, `secret.type` fails loudly rather
+    /// than typing nothing and reporting success — an agent told a password was
+    /// entered would go on to submit an empty form.
+    #[must_use]
+    pub fn with_secrets(mut self, s: Box<dyn SecretResolver>) -> Self {
+        self.secrets = Some(s);
         self
     }
 
@@ -362,7 +378,22 @@ impl Dispatcher {
 
             // Deliberately unimplemented, and reported as such. A silent
             // success here would let an agent believe a password was typed.
-            Kind::SecretType(_) => return Err(DispatchError::NotImplemented("secret.type")),
+            Kind::SecretType(req) => {
+                let resolver = self.secrets.as_ref().ok_or(DispatchError::NoDriver("secret.type"))?;
+                // The value is resolved, typed, and dropped, all inside this
+                // block. It is bound to `value` for the two lines it takes to
+                // type it and never named again — not in the result, not in an
+                // error, not in the audit the caller writes from `secret_ref`.
+                // §9.3: the plaintext must reach neither the log nor a capture.
+                let value = resolver
+                    .resolve(&req.secret_ref)
+                    .map_err(|e| DispatchError::Secret(req.secret_ref.clone(), e))?;
+                self.input.type_text(value.expose(), Duration::from_millis(20))?;
+                self.mark_input();
+                // No value in the result — only that the ref was typed. The
+                // audit is written from the request's secret_ref, never here.
+                None
+            }
             Kind::AppLaunch(req) => {
                 let spec = self.resolve_launch(req)?;
                 let process = self
@@ -1105,6 +1136,71 @@ mod tests {
         let r = d.execute(&a).unwrap();
         let Some(v1::action_result::Value::Wait(w)) = r.value else { panic!() };
         assert!(!w.satisfied);
+    }
+
+    #[test]
+    fn secret_type_types_the_value_but_never_returns_or_logs_it() {
+        // §9.3: the plaintext must reach the screen but not the result, the
+        // audit, or an error. The agent sent only the ref.
+        use crate::platform::fake::FakeSecrets;
+        let input = std::sync::Arc::new(FakeInput::new().with_screen(1920, 1080));
+        let d = Dispatcher::new(
+            FrameSource::new(Box::new(FakeDisplay::new(1920, 1080))),
+            Box::new(input.clone()),
+        )
+        .with_secrets(Box::new(FakeSecrets::new().with("sec_pw", "hunter2-secret")));
+
+        let a = launch_action(Kind::SecretType(v1::SecretType { secret_ref: "sec_pw".into() }));
+        let r = d.execute(&a).expect("secret.type failed");
+
+        // The value was typed.
+        assert_eq!(
+            input.events(),
+            vec![InputEvent::Type("hunter2-secret".into())],
+            "the secret was not typed"
+        );
+        // But it is nowhere in the result — the whole result debug-prints
+        // without the plaintext.
+        assert!(r.ok);
+        assert!(r.value.is_none(), "secret.type must return no value payload");
+        assert!(!format!("{r:?}").contains("hunter2-secret"), "the value leaked into the result");
+    }
+
+    #[test]
+    fn secret_type_error_names_the_ref_not_the_value() {
+        // An unknown ref fails, and the error carries the ref so an operator can
+        // debug it — but there is no value to leak, and the redacting type means
+        // even a resolved-then-rejected value could not.
+        use crate::platform::fake::FakeSecrets;
+        let (d, _) = app_dispatcher_with_secrets();
+        let a = launch_action(Kind::SecretType(v1::SecretType { secret_ref: "sec_missing".into() }));
+        let e = d.execute(&a).unwrap_err();
+        assert!(matches!(e, DispatchError::Secret(_, _)));
+        assert!(format!("{e}").contains("sec_missing"));
+        let _ = FakeSecrets::new();
+    }
+
+    #[test]
+    fn secret_type_without_a_resolver_fails_loudly() {
+        // A silent success would have the agent believe a password was entered
+        // and submit an empty form.
+        let d = Dispatcher::new(
+            FrameSource::new(Box::new(FakeDisplay::new(64, 48))),
+            Box::new(FakeInput::new()),
+        );
+        let a = launch_action(Kind::SecretType(v1::SecretType { secret_ref: "sec_x".into() }));
+        assert!(matches!(d.execute(&a).unwrap_err(), DispatchError::NoDriver("secret.type")));
+    }
+
+    fn app_dispatcher_with_secrets() -> (Dispatcher, std::sync::Arc<crate::platform::fake::FakeInput>) {
+        use crate::platform::fake::FakeSecrets;
+        let input = std::sync::Arc::new(FakeInput::new().with_screen(1920, 1080));
+        let d = Dispatcher::new(
+            FrameSource::new(Box::new(FakeDisplay::new(1920, 1080))),
+            Box::new(input.clone()),
+        )
+        .with_secrets(Box::new(FakeSecrets::new().with("sec_pw", "v")));
+        (d, input)
     }
 
     #[test]

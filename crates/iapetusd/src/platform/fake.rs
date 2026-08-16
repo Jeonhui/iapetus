@@ -325,6 +325,39 @@ impl Process for std::sync::Arc<FakeProcess> {
     }
 }
 
+/// A secret resolver backed by an in-memory map, for testing `secret.type`.
+#[derive(Default)]
+pub struct FakeSecrets {
+    values: Mutex<std::collections::HashMap<String, String>>,
+}
+
+impl FakeSecrets {
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    #[must_use]
+    pub fn with(self, secret_ref: &str, value: &str) -> Self {
+        self.values.lock().unwrap().insert(secret_ref.to_string(), value.to_string());
+        self
+    }
+}
+
+impl crate::secret::SecretResolver for FakeSecrets {
+    fn resolve(
+        &self,
+        secret_ref: &str,
+    ) -> std::result::Result<crate::secret::SecretValue, crate::secret::SecretError> {
+        self.values
+            .lock()
+            .unwrap()
+            .get(secret_ref)
+            .map(|v| crate::secret::SecretValue::new(v.clone()))
+            .ok_or_else(|| crate::secret::SecretError::Unknown(secret_ref.to_string()))
+    }
+}
+
 /// Answers window queries from a script rather than a display server.
 #[derive(Default)]
 pub struct FakeWindows {

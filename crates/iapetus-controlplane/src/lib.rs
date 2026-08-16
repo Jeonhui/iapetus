@@ -22,6 +22,8 @@
 //!   pulling one back does not, so the revoked `jti` list is held here and
 //!   expires entries as the short token lifetimes age out.
 
+pub mod secrets;
+
 use std::collections::HashMap;
 use std::sync::Mutex;
 

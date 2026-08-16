@@ -17,6 +17,7 @@ path = "src/main.rs"
 
 [dependencies]
 iapetus-auth = { path = "../iapetus-auth" }
+iapetus-proto = { path = "../iapetus-proto", default-features = false }
 ed25519-dalek = { version = "2", default-features = false, features = ["std"] }
 base64 = "0.22"
 sha2 = "0.10"

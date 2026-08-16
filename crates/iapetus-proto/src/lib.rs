@@ -11,6 +11,7 @@
 pub mod id;
 pub mod lease;
 pub mod limits;
+pub mod secret;
 
 /// Types generated from `proto/iapetus/v1/*.proto`.
 pub mod v1 {
