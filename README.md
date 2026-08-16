@@ -46,7 +46,7 @@ with client.session("dsk_1", gateway_token="dev-write") as c:
     png = c.screenshot()                          # PNG bytes of the live screen
 ```
 
-See [`sdk/python`](sdk/python) for the full surface.
+SDKs for [Python](sdk/python) and [TypeScript](sdk/typescript) — same surface.
 
 The control plane is at <http://localhost:8090>. Mint a real token against it:
 
@@ -153,7 +153,7 @@ Not yet built:
 - Desktop provisioning (Firecracker microVMs) and the scheduler (§12.4, §19.2)
 - The WebRTC media path — the default; today's stream is the §6.3 fallback
 - The rest of the REST API: desktops, policy, webhooks, event stream (§8.4)
-- The TypeScript SDK (§8.6) — the Python SDK is in [`sdk/python`](sdk/python)
+- Desktop provisioning, the WebRTC path, and the rest of the REST API above
 
 ## License
 
