@@ -150,6 +150,22 @@ The L2 tests are the ones the specification calls the most important layer
 split jamo — surfaces only in production, so they are verified against a real X
 server rather than mocked.
 
+## Customizing the desktop
+
+The demo desktop's background is a plain image, swappable without a rebuild.
+Point `IAPETUS_WALLPAPER` at a file mounted into the desktop container:
+
+```yaml
+# docker-compose.yml, under the desktop service
+environment:
+  IAPETUS_WALLPAPER: /wallpaper.png
+volumes:
+  - ./my-wallpaper.png:/wallpaper.png:ro
+```
+
+`IAPETUS_MINIMAL=1` drops the panel, dock, and apps for the lean agent-only
+state (§12.5 lever 2) — just the window manager, ~30MB.
+
 ## Production vs. development
 
 The compose stack is wired for development: the gateway trusts the shared

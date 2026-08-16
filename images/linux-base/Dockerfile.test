@@ -26,6 +26,8 @@ COPY images/linux-base/apps.json /etc/iapetus/apps.json
 # The S1 fixture: a local page, so the scenario proves our input path rather
 # than measuring a search engine's uptime.
 COPY images/linux-base/s1.html /opt/iapetus/s1.html
+COPY images/linux-base/wallpaper.png /opt/iapetus/wallpaper.png
+COPY images/linux-base/tint2rc /opt/iapetus/tint2rc
 COPY images/linux-base/run-l2.sh /usr/local/bin/run-l2.sh
 RUN chmod +x /usr/local/bin/run-l2.sh
 

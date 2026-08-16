@@ -48,6 +48,8 @@ COPY --from=builder /src/target/release/iapetus-controlplane /usr/local/bin/iape
 # anything on the disk still launches by path under OWNER mode (§7.3).
 COPY images/linux-base/apps.json /etc/iapetus/apps.json
 COPY images/linux-base/s1.html /opt/iapetus/s1.html
+COPY images/linux-base/wallpaper.png /opt/iapetus/wallpaper.png
+COPY images/linux-base/tint2rc /opt/iapetus/tint2rc
 COPY images/linux-base/compose-desktop.sh /usr/local/bin/compose-desktop.sh
 COPY images/linux-base/entrypoint.sh /usr/local/bin/entrypoint.sh
 RUN chmod +x /usr/local/bin/entrypoint.sh /usr/local/bin/compose-desktop.sh

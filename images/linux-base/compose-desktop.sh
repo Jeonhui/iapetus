@@ -12,6 +12,10 @@ set -euo pipefail
 
 GATEWAY_INGEST="${IAPETUS_GATEWAY_INGEST:-ws://gateway:8080/ingest?token=dev}"
 MINIMAL="${IAPETUS_MINIMAL:-0}"
+# The wallpaper is whatever IAPETUS_WALLPAPER points at, defaulting to the
+# shipped image. A developer swaps it by mounting their own file over this path
+# in compose — no rebuild — or by pointing the variable elsewhere.
+WALLPAPER="${IAPETUS_WALLPAPER:-/opt/iapetus/wallpaper.png}"
 
 Xvfb "${DISPLAY}" -screen 0 "${SCREEN_GEOMETRY}" -nolisten tcp &
 for _ in $(seq 1 100); do
@@ -26,37 +30,35 @@ xdpyinfo -display "${DISPLAY}" >/dev/null 2>&1 || { echo "X server failed to sta
 openbox &
 sleep 0.5
 
-# A desktop colour, so the root window is not the bare black openbox leaves.
-xsetroot -solid "#243447" 2>/dev/null || true
-
 if [ "$MINIMAL" != "1" ]; then
-    # A panel with a clock and a task list, so open windows are visible and
-    # switchable — the "there is a desktop here" cue a bare WM lacks.
-    tint2 >/dev/null 2>&1 &
-
-    # A file manager managing the desktop: it draws the background and the
-    # desktop icons (a trash can, mounted volumes), which is what makes it read
-    # as a desktop rather than a floating window. Its own config sets the
-    # background colour, since it otherwise paints the root window black —
-    # overriding xsetroot above.
+    # The file manager draws the wallpaper and the desktop icons. Its config
+    # points at the shipped wallpaper image, since openbox leaves the root
+    # window black on its own.
     mkdir -p "$HOME/.config/pcmanfm/default"
     cat > "$HOME/.config/pcmanfm/default/desktop-items-0.conf" <<'CFG'
 [*]
-wallpaper_mode=color
-desktop_bg=#243447
-desktop_fg=#e8edf4
+wallpaper_mode=stretch
+wallpaper=WALLPAPER_PATH
+desktop_bg=#8a8d92
+desktop_fg=#ffffff
 desktop_shadow=#000000
 show_documents=0
 show_trash=1
 show_mounts=1
 CFG
+    # Substitute the chosen wallpaper path into the config.
+    sed -i "s|WALLPAPER_PATH|${WALLPAPER}|" "$HOME/.config/pcmanfm/default/desktop-items-0.conf"
     pcmanfm --desktop --profile=default >/dev/null 2>&1 &
     sleep 0.5
 
-    # A terminal, so the session shows more than one app — an agent would launch
-    # these through app.launch instead, but a human opening the viewer should
-    # land on a populated desktop.
-    xterm -geometry 80x24+40+80 -title "Terminal" >/dev/null 2>&1 &
+    # A centered launcher dock — Chrome, file manager, terminal — instead of a
+    # taskbar, so the session reads like the docks people know.
+    mkdir -p "$HOME/.config/tint2"
+    cp /opt/iapetus/tint2rc "$HOME/.config/tint2/tint2rc"
+    tint2 -c "$HOME/.config/tint2/tint2rc" >/dev/null 2>&1 &
+
+    # A terminal, so the desktop starts with an app already open.
+    xterm -geometry 84x26+60+90 -title "Terminal" >/dev/null 2>&1 &
 fi
 
 # The browser, in a normal window (not kiosk) so it sits on the desktop

@@ -47,6 +47,11 @@ services:
       DISPLAY: ":1"
       SCREEN_GEOMETRY: 1920x1080x24
       IAPETUS_GATEWAY_INGEST: ws://gateway:8080/ingest?token=dev
+      # Set your own desktop background by pointing this at a mounted image:
+      # IAPETUS_WALLPAPER: /wallpaper.png
+    # ...and mounting it (no rebuild needed):
+    # volumes:
+    #   - ./my-wallpaper.png:/wallpaper.png:ro
     # /dev/shm defaults to 64MB in Docker, which Chromium's renderer crashes on.
     shm_size: 512m
     depends_on:

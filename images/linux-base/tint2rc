@@ -1,0 +1,30 @@
+# A centered launcher dock for the demo desktop.
+#
+# The background block comes first so it is id 1, which the panel then
+# references. A fixed panel width keeps `center` reliable — a 0% (content) width
+# with center alignment lands at the left edge on this tint2.
+
+# Background 1: the dock itself — rounded, translucent.
+rounded = 18
+border_width = 1
+border_sides = TBLR
+background_color = #1b2030 82
+border_color = #ffffff 16
+
+panel_items = L
+panel_position = bottom center horizontal
+panel_size = 240 64
+panel_margin = 0 12
+panel_padding = 14 8 10
+panel_background_id = 1
+panel_layer = top
+panel_shrink = 0
+
+launcher_padding = 8 14 8
+launcher_background_id = 0
+launcher_icon_background_id = 0
+launcher_icon_size = 44
+launcher_tooltip = 1
+launcher_item_app = /usr/share/applications/chromium.desktop
+launcher_item_app = /usr/share/applications/pcmanfm.desktop
+launcher_item_app = /usr/share/applications/debian-xterm.desktop
