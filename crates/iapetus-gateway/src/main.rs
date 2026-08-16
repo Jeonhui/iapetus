@@ -24,7 +24,7 @@ use std::time::{Duration, Instant};
 
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::State;
-use axum::response::{Html, IntoResponse};
+use axum::response::IntoResponse;
 use axum::routing::{get, post};
 use axum::Router;
 use iapetus_auth::{Jwks, Policy, AUDIENCE, AUDIENCE_GUEST};
@@ -206,6 +206,11 @@ struct App {
     /// token is an Ed25519 JWT; `None` for local development, which falls back
     /// to the shared secrets above so the demo needs no key material.
     jwks: Option<Jwks>,
+    /// Origins allowed to frame the viewer (§7.5 V-09). Empty denies framing
+    /// entirely — the default, because the viewer carries a token and can hold
+    /// WRITE, so an open frame policy is a clickjacking hole. A parent product
+    /// registers its exact origin here.
+    embed_origins: Vec<String>,
 }
 
 /// What a viewer socket is allowed to do (§7.5).
@@ -224,6 +229,16 @@ async fn main() {
     let view_token = std::env::var("IAPETUS_VIEW_TOKEN").unwrap_or_else(|_| "dev".into());
     let write_token = std::env::var("IAPETUS_WRITE_TOKEN").unwrap_or_else(|_| "dev-write".into());
     let jwks = std::env::var("IAPETUS_JWKS").ok().and_then(|s| parse_jwks(&s));
+    let embed_origins: Vec<String> = std::env::var("IAPETUS_EMBED_ORIGINS")
+        .unwrap_or_default()
+        .split(',')
+        .map(str::trim)
+        .filter(|o| !o.is_empty())
+        .map(String::from)
+        .collect();
+    if !embed_origins.is_empty() {
+        println!("framing allowed from: {}", embed_origins.join(", "));
+    }
     if jwks.is_some() {
         println!("verifying §8.1 JWTs against the configured JWKS");
     } else {
@@ -252,6 +267,7 @@ async fn main() {
         view_token,
         write_token,
         jwks,
+        embed_origins,
     });
 
     // Reap the lease on a timer, so a human who idles out or a holder that
@@ -269,7 +285,7 @@ async fn main() {
     }
 
     let router = Router::new()
-        .route("/", get(|| async { Html(include_str!("viewer.html")) }))
+        .route("/", get(viewer_page))
         .route("/view", get(view_ws))
         .route("/ingest", get(ingest_ws))
         .route("/v1/action", post(action))
@@ -592,6 +608,31 @@ async fn action(
     }
 }
 
+/// Serves the viewer page with the frame policy §7.5 requires.
+///
+/// `frame-ancestors` is emitted from the configured origins: none means the
+/// page cannot be framed at all (the safe default for a token-bearing page),
+/// and a parent product's exact origin lets it embed the viewer. `X-Frame-
+/// Options` is set alongside for the browsers that still honour only that.
+async fn viewer_page(State(app): State<Arc<App>>) -> impl IntoResponse {
+    let ancestors = if app.embed_origins.is_empty() {
+        "'none'".to_string()
+    } else {
+        app.embed_origins.join(" ")
+    };
+    let csp = format!("frame-ancestors {ancestors}");
+    (
+        [
+            (axum::http::header::CONTENT_SECURITY_POLICY, csp),
+            (
+                axum::http::header::CONTENT_TYPE,
+                "text/html; charset=utf-8".to_string(),
+            ),
+        ],
+        include_str!("viewer.html"),
+    )
+}
+
 /// Wall-clock seconds since the epoch, for JWT expiry. Distinct from the lease's
 /// monotonic `now`: a token's exp is an absolute time, a lease's timers are
 /// relative, and conflating them would check one against the wrong clock.
@@ -753,6 +794,7 @@ mod tests {
             view_token: "look".into(),
             write_token: "drive".into(),
             jwks: None,
+            embed_origins: vec![],
         }
     }
 
@@ -886,6 +928,18 @@ mod tests {
         // The ingest token must not double as a viewer token: the guest's
         // credential is not a person's.
         assert_eq!(a.control_for(Some("ing")), None);
+    }
+
+    #[test]
+    fn framing_is_denied_by_default_and_allowed_only_for_registered_origins() {
+        // §7.5: the viewer carries a token and can hold WRITE, so an open frame
+        // policy is a clickjacking hole. Default denies; a parent product's
+        // exact origin opts in.
+        let mut a = app();
+        assert!(a.embed_origins.is_empty(), "framing must be closed by default");
+
+        a.embed_origins = vec!["https://parent.example".into()];
+        assert_eq!(a.embed_origins.join(" "), "https://parent.example");
     }
 
     #[test]

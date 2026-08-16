@@ -1,0 +1,103 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Iapetus — parent app demo</title>
+<!--
+  A minimal parent product: the Iapetus desktop embedded in an iframe (§7.5
+  V-09), with controls beside it that drive the agent through this app's own
+  server. The Project Key never reaches this page — the server mints the viewer
+  token and proxies the actions.
+-->
+<style>
+  :root { color-scheme: light dark; }
+  * { box-sizing: border-box; }
+  body { margin: 0; font: 14px/1.5 ui-sans-serif, system-ui, sans-serif;
+         display: grid; grid-template-columns: 300px 1fr; height: 100vh; }
+  aside { padding: 20px; border-right: 1px solid #8883; display: flex;
+          flex-direction: column; gap: 14px; overflow: auto; }
+  h1 { font-size: 16px; margin: 0 0 4px; }
+  p.sub { margin: 0; color: #8890; font-size: 12px; }
+  .group { display: flex; flex-direction: column; gap: 6px; }
+  label { font-size: 12px; color: #8890; }
+  input, button { font: inherit; padding: 8px 10px; border-radius: 8px;
+                  border: 1px solid #8884; background: transparent; color: inherit; }
+  button { cursor: pointer; background: #2563eb; color: #fff; border-color: #2563eb; }
+  button.secondary { background: transparent; color: inherit; }
+  button:hover { filter: brightness(1.08); }
+  button:disabled { opacity: .5; cursor: default; }
+  #status { font-size: 12px; color: #8890; min-height: 1.2em; }
+  main { position: relative; background: #000; }
+  iframe { width: 100%; height: 100%; border: 0; }
+  #shot { position: absolute; inset: 12px; max-width: calc(100% - 24px);
+          max-height: calc(100% - 24px); box-shadow: 0 8px 40px #000a;
+          border-radius: 8px; display: none; }
+</style>
+
+<aside>
+  <div>
+    <h1>Acme Assistant</h1>
+    <p class="sub">A parent product embedding an Iapetus desktop.</p>
+  </div>
+
+  <div class="group">
+    <label>The desktop is live below. Drive the agent:</label>
+    <button id="launch">Open browser</button>
+    <input id="text" placeholder="text to type" value="iapetus">
+    <button id="type" class="secondary">Type it</button>
+    <button id="enter" class="secondary">Press Enter</button>
+    <button id="shotBtn" class="secondary">Screenshot</button>
+  </div>
+
+  <div id="status">connecting…</div>
+
+  <p class="sub">
+    You can also take over directly in the embedded desktop — click into it and
+    type. The agent and you share one screen and one control lease (§5.6).
+  </p>
+</aside>
+
+<main>
+  <iframe id="viewer" title="Iapetus desktop"></iframe>
+  <img id="shot" alt="screenshot">
+</main>
+
+<script>
+const statusEl = document.getElementById("status");
+const set = (t) => (statusEl.textContent = t);
+
+// The viewer URL is minted by our server, so the token is short-lived and the
+// Project Key stays server-side.
+fetch("/api/viewer-url")
+  .then((r) => r.json())
+  .then(({ url }) => {
+    document.getElementById("viewer").src = url;
+    set("desktop embedded");
+  })
+  .catch((e) => set("failed to get viewer url: " + e));
+
+async function agent(action, arg) {
+  set(`agent: ${action}…`);
+  const r = await fetch("/api/agent", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ action, arg }),
+  });
+  const data = await r.json();
+  if (!r.ok) { set(`error: ${data.code || ""} ${data.error || ""}`); return null; }
+  set(`agent: ${action} ✓`);
+  return data;
+}
+
+document.getElementById("launch").onclick = () => agent("launch");
+document.getElementById("type").onclick = () =>
+  agent("type", document.getElementById("text").value);
+document.getElementById("enter").onclick = () => agent("enter");
+document.getElementById("shotBtn").onclick = async () => {
+  const data = await agent("screenshot");
+  if (data?.png) {
+    const img = document.getElementById("shot");
+    img.src = "data:image/png;base64," + data.png;
+    img.style.display = "block";
+    setTimeout(() => (img.style.display = "none"), 2500);
+  }
+};
+</script>

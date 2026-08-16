@@ -32,6 +32,9 @@ services:
     command: iapetus-gateway
     environment:
       IAPETUS_GATEWAY_BIND: 0.0.0.0:8080
+      # Allow the parent-app demo (examples/parent-app) to frame the viewer
+      # (§7.5 V-09). Framing is denied by default; this opts in the demo origin.
+      IAPETUS_EMBED_ORIGINS: http://localhost:3000
     ports:
       - "8080:8080"
     depends_on:
