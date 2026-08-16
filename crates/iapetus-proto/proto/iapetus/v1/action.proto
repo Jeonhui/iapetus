@@ -65,6 +65,15 @@ message AppLaunchResult {
   optional Window window = 2;         // present only when wait_for_window was set
 }
 
+// PRD §7.2: a timeout is a result, not an error — the agent needs to tell "the
+// thing I waited for did not happen" from "the call failed", so `satisfied`
+// carries that rather than an error code.
+message WaitResult {
+  bool satisfied = 1;                 // the condition was met before the timeout
+  int32 waited_ms = 2;
+  optional Window window = 3;         // the window that appeared (WINDOW_APPEARS)
+}
+
 message ScreenInfo {
   Display display = 1;
   int32 monitor_count = 2;            // always 1 in v1 (§7.2)
@@ -198,6 +207,7 @@ message ActionResult {
     ShellResult shell = 9;
     ScreenInfo screen = 10;
     AppLaunchResult app_launch = 11;
+    WaitResult wait = 12;
   }
 }
 

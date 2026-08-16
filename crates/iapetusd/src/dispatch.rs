@@ -393,7 +393,7 @@ impl Dispatcher {
                     truncated: out.truncated,
                 }))
             }
-            Kind::WaitFor(_) => return Err(DispatchError::NotImplemented("wait_for")),
+            Kind::WaitFor(req) => Some(self.wait_for(req)?),
         };
 
         Ok(v1::ActionResult {
@@ -402,6 +402,97 @@ impl Dispatcher {
             error: None,
             value,
         })
+    }
+
+    /// Waits for a screen change, a window, or a fixed duration (§7.2).
+    ///
+    /// A timeout is a result, not an error: the agent must be able to tell "the
+    /// window never opened" from "the call failed", because the first is often
+    /// the very thing it is checking for. So this returns `satisfied: false`
+    /// rather than erroring when the deadline passes.
+    ///
+    /// This is an observation action — it holds no lease and anchors no
+    /// freshness. It does not `mark_input`, because it changes nothing.
+    fn wait_for(&self, req: &v1::WaitFor) -> Result<v1::action_result::Value> {
+        let (default_ms, max_ms) = limits::TIMEOUT_WAIT_FOR_MS;
+        let ms = match req.timeout_ms {
+            n if n <= 0 => default_ms,
+            n => (n as u32).min(max_ms),
+        };
+        let timeout = Duration::from_millis(u64::from(ms));
+        let poll = Duration::from_millis(limits::WAIT_POLL_MS);
+        let started = std::time::Instant::now();
+
+        let mode = v1::WaitMode::try_from(req.mode).unwrap_or(v1::WaitMode::Unspecified);
+        let (satisfied, window) = match mode {
+            // A fixed pause. Always "satisfied" — the condition was simply the
+            // passage of time, and it always passes.
+            v1::WaitMode::Duration => {
+                std::thread::sleep(timeout);
+                (true, None)
+            }
+
+            // §6.3: settle when two consecutive frames differ below the
+            // threshold. The first frame is the baseline; each later one is
+            // compared to the one before it, not to the baseline, or a slow
+            // fade would count as stable the moment it paused.
+            v1::WaitMode::ScreenStable | v1::WaitMode::Unspecified => {
+                let mut prev = self.frames.capture_now(None)?;
+                let mut stable = false;
+                while started.elapsed() < timeout {
+                    std::thread::sleep(poll);
+                    let cur = self.frames.capture_now(None)?;
+                    if frame_delta(&prev, &cur) < limits::SCREEN_STABLE_MAX_CHANGED {
+                        stable = true;
+                        break;
+                    }
+                    prev = cur;
+                }
+                (stable, None)
+            }
+
+            // A window whose title matches the regex. §7.2 pairs this with the
+            // regex field; an unset or invalid pattern matches nothing rather
+            // than everything, so a typo does not silently satisfy the wait.
+            v1::WaitMode::WindowAppears => {
+                let re = req
+                    .window_title_regex
+                    .as_deref()
+                    .and_then(|p| regex::Regex::new(p).ok());
+                let windows = self.windows.as_ref().ok_or(DispatchError::NoDriver("wait_for"))?;
+                let mut found = None;
+                loop {
+                    if let Some(re) = &re {
+                        if let Some(w) = windows.list()?.into_iter().find(|w| re.is_match(&w.title)) {
+                            found = Some(w);
+                            break;
+                        }
+                    }
+                    if started.elapsed() >= timeout {
+                        break;
+                    }
+                    std::thread::sleep(poll);
+                }
+                let win = found.map(|w| v1::Window {
+                    id: format!("win_{}", w.id),
+                    title: w.title,
+                    bounds: Some(v1::Bounds {
+                        x: w.bounds.x,
+                        y: w.bounds.y,
+                        width: w.bounds.width as i32,
+                        height: w.bounds.height as i32,
+                    }),
+                    focused: false,
+                });
+                (win.is_some(), win)
+            }
+        };
+
+        Ok(v1::action_result::Value::Wait(v1::WaitResult {
+            satisfied,
+            waited_ms: started.elapsed().as_millis().min(i32::MAX as u128) as i32,
+            window,
+        }))
     }
 
     /// Executes a batch, fail-fast (§7.2).
@@ -499,6 +590,30 @@ pub fn prost_time(t: SystemTime) -> prost_types::Timestamp {
     prost_types::Timestamp { seconds: secs as i64, nanos: nanos as i32 }
 }
 
+/// The fraction of pixels that differ between two frames.
+///
+/// Returns 1.0 (maximally different) when the geometry changed — a resize is
+/// never "stable" — so a wait cannot settle across a resolution change it has
+/// not actually seen settle.
+fn frame_delta(a: &crate::platform::Frame, b: &crate::platform::Frame) -> f64 {
+    if a.width != b.width || a.height != b.height || a.pixels.len() != b.pixels.len() {
+        return 1.0;
+    }
+    let total = (a.width as usize) * (a.height as usize);
+    if total == 0 {
+        return 0.0;
+    }
+    // Compare the RGB of each pixel; the fourth byte is undefined on BGRX
+    // captures (§X11) and would make every frame differ.
+    let changed = a
+        .pixels
+        .chunks_exact(4)
+        .zip(b.pixels.chunks_exact(4))
+        .filter(|(p, q)| p[0..3] != q[0..3])
+        .count();
+    changed as f64 / total as f64
+}
+
 /// The result reported for a request that carried no action.
 #[must_use]
 pub fn empty_action_result() -> v1::ActionResult {
@@ -584,6 +699,26 @@ mod tests {
             + Duration::new(taken.seconds as u64, taken.nanos as u32);
 
         assert!(taken >= clicked_at.unwrap(), "screenshot predates the click that preceded it");
+    }
+
+    #[test]
+    fn frame_delta_ignores_the_undefined_alpha_byte() {
+        use crate::platform::{Frame, PixelFormat};
+        use std::time::SystemTime;
+        let mk = |a3: u8| Frame {
+            width: 2,
+            height: 1,
+            // Two pixels; the fourth byte varies but the RGB is identical.
+            pixels: vec![10, 20, 30, a3, 40, 50, 60, a3],
+            format: PixelFormat::Bgrx,
+            captured_at: SystemTime::now(),
+        };
+        assert_eq!(frame_delta(&mk(0x00), &mk(0xFF)), 0.0, "alpha difference counted as change");
+
+        let a = mk(0);
+        let mut b = mk(0);
+        b.pixels[0] = 99; // change one pixel's red
+        assert_eq!(frame_delta(&a, &b), 0.5, "one of two pixels changed");
     }
 
     #[test]
@@ -763,6 +898,81 @@ mod tests {
             wait_for_window: None,
         }));
         assert!(d.execute(&a).is_err());
+    }
+
+    #[test]
+    fn wait_for_duration_always_satisfies_after_the_time_passes() {
+        let (d, _) = app_dispatcher();
+        let a = launch_action(Kind::WaitFor(v1::WaitFor {
+            mode: v1::WaitMode::Duration as i32,
+            timeout_ms: 60,
+            window_title_regex: None,
+        }));
+        let start = std::time::Instant::now();
+        let r = d.execute(&a).expect("wait failed");
+        assert!(start.elapsed() >= Duration::from_millis(50), "it returned before the duration");
+        let Some(v1::action_result::Value::Wait(w)) = r.value else { panic!("no wait result") };
+        assert!(w.satisfied, "a fixed duration must always satisfy");
+        assert!(w.window.is_none());
+    }
+
+    #[test]
+    fn wait_for_a_still_screen_settles_quickly() {
+        // The fake display returns identical frames, so the screen is stable
+        // from the first comparison and the wait returns well before its
+        // timeout rather than sleeping it out.
+        let (d, _) = app_dispatcher();
+        let a = launch_action(Kind::WaitFor(v1::WaitFor {
+            mode: v1::WaitMode::ScreenStable as i32,
+            timeout_ms: 5000,
+            window_title_regex: None,
+        }));
+        let start = std::time::Instant::now();
+        let r = d.execute(&a).unwrap();
+        assert!(start.elapsed() < Duration::from_secs(2), "a still screen should settle fast");
+        let Some(v1::action_result::Value::Wait(w)) = r.value else { panic!() };
+        assert!(w.satisfied, "an unchanging screen is stable");
+    }
+
+    #[test]
+    fn wait_for_a_window_finds_it_by_title_regex() {
+        // The fake windows driver has one window titled "Chromium"; a matching
+        // pattern satisfies and returns it, a non-matching one times out.
+        let (d, _) = app_dispatcher();
+        let hit = launch_action(Kind::WaitFor(v1::WaitFor {
+            mode: v1::WaitMode::WindowAppears as i32,
+            timeout_ms: 1000,
+            window_title_regex: Some("^Chrom".into()),
+        }));
+        let r = d.execute(&hit).unwrap();
+        let Some(v1::action_result::Value::Wait(w)) = r.value else { panic!() };
+        assert!(w.satisfied, "the matching window was not found");
+        assert_eq!(w.window.unwrap().title, "Chromium");
+
+        let miss = launch_action(Kind::WaitFor(v1::WaitFor {
+            mode: v1::WaitMode::WindowAppears as i32,
+            timeout_ms: 300,
+            window_title_regex: Some("^Nonexistent".into()),
+        }));
+        let r = d.execute(&miss).unwrap();
+        let Some(v1::action_result::Value::Wait(w)) = r.value else { panic!() };
+        assert!(!w.satisfied, "a non-matching wait must report a timeout, not an error");
+        assert!(w.window.is_none());
+    }
+
+    #[test]
+    fn wait_for_window_with_no_pattern_matches_nothing_rather_than_everything() {
+        // A missing or invalid regex must not silently satisfy against the
+        // first window on screen — a typo would then look like success.
+        let (d, _) = app_dispatcher();
+        let a = launch_action(Kind::WaitFor(v1::WaitFor {
+            mode: v1::WaitMode::WindowAppears as i32,
+            timeout_ms: 300,
+            window_title_regex: None,
+        }));
+        let r = d.execute(&a).unwrap();
+        let Some(v1::action_result::Value::Wait(w)) = r.value else { panic!() };
+        assert!(!w.satisfied);
     }
 
     #[test]

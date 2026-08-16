@@ -50,6 +50,28 @@ struct TestWindow {
 }
 
 impl TestWindow {
+    /// A window the window manager manages, so it appears in `_NET_CLIENT_LIST`.
+    /// Used by the title-based `wait_for` test — override-redirect windows are
+    /// deliberately absent from that list, which is why `open` cannot serve here.
+    fn open_managed(title: &str) -> Self {
+        let (conn, screen_num) = x11rb::connect(None).expect("connect");
+        let screen = &conn.setup().roots[screen_num];
+        let win = conn.generate_id().expect("generate_id");
+        conn.create_window(
+            COPY_DEPTH_FROM_PARENT, win, screen.root, 200, 200, 300, 200, 0,
+            WindowClass::INPUT_OUTPUT, screen.root_visual,
+            &CreateWindowAux::new().event_mask(EventMask::EXPOSURE),
+        )
+        .expect("create_window");
+        let w = Self { conn, win };
+        w.set_title(title);
+        w.conn.map_window(win).expect("map");
+        w.conn.flush().expect("flush");
+        // Give the window manager a moment to adopt it into the client list.
+        std::thread::sleep(Duration::from_millis(300));
+        w
+    }
+
     fn open(x: i16, y: i16, w: u16, h: u16) -> Self {
         let (conn, screen_num) = x11rb::connect(None).expect("connect");
         let screen = &conn.setup().roots[screen_num];
@@ -101,6 +123,35 @@ impl TestWindow {
         conn.flush().expect("flush");
 
         Self { conn, win }
+    }
+
+    /// Sets the window's EWMH title, so a title-regex wait can match it.
+    fn set_title(&self, title: &str) {
+        use x11rb::protocol::xproto::{AtomEnum, PropMode};
+        let net_wm_name = self
+            .conn
+            .intern_atom(false, b"_NET_WM_NAME")
+            .expect("intern")
+            .reply()
+            .expect("intern reply")
+            .atom;
+        let utf8 = self
+            .conn
+            .intern_atom(false, b"UTF8_STRING")
+            .expect("intern")
+            .reply()
+            .expect("intern reply")
+            .atom;
+        self.conn
+            .change_property(PropMode::REPLACE, self.win, net_wm_name, utf8, 8, title.len() as u32, title.as_bytes())
+            .expect("set title");
+        // WM_NAME too, as the legacy fallback the driver also reads.
+        let wm_name: x11rb::protocol::xproto::Atom = AtomEnum::WM_NAME.into();
+        let string_ty: x11rb::protocol::xproto::Atom = AtomEnum::STRING.into();
+        self.conn
+            .change_property(PropMode::REPLACE, self.win, wm_name, string_ty, 8, title.len() as u32, title.as_bytes())
+            .expect("set WM_NAME");
+        self.conn.flush().expect("flush");
     }
 
     /// Collects events for up to `timeout`, returning those that arrive.
@@ -509,4 +560,83 @@ fn shell_exec_truncates_a_flood_and_says_so() {
     let out = p.run(&spec, Duration::from_secs(10), cap).expect("run");
     assert!(out.truncated, "5MB of output through a 64KB cap was not marked truncated");
     assert!(out.stdout.len() <= cap, "output {} exceeded the cap {cap}", out.stdout.len());
+}
+
+// wait_for against a real screen and real windows. The fake backend returns
+// identical frames and a scripted window list, so only here can screen_stable
+// see actual motion settle and window_appears match a title that truly exists.
+
+#[test]
+fn wait_for_a_window_matches_a_real_title() {
+    require_x11!();
+
+    use iapetusd::dispatch::Dispatcher;
+    use iapetusd::frame::FrameSource;
+    use iapetus_proto::v1::{self, action::Kind};
+
+    let display = std::sync::Arc::new(X11Display::open().expect("no display"));
+    let d = Dispatcher::new(
+        FrameSource::new(Box::new(display.clone())),
+        Box::new(X11Input::open().expect("XTEST")),
+    )
+    .with_windows(Box::new(display.clone()));
+
+    // No such window yet: the wait must time out with satisfied=false, not hang
+    // and not error.
+    let miss = v1::Action {
+        kind: Some(Kind::WaitFor(v1::WaitFor {
+            mode: v1::WaitMode::WindowAppears as i32,
+            timeout_ms: 500,
+            window_title_regex: Some("^IAPETUS-WAIT-PROBE".into()),
+        })),
+    };
+    let r = d.execute(&miss).unwrap();
+    let Some(v1::action_result::Value::Wait(w)) = r.value else { panic!("no wait result") };
+    assert!(!w.satisfied, "matched a window that does not exist");
+
+    // Map a window-manager-managed window with that title, then the wait finds
+    // it through _NET_CLIENT_LIST.
+    let _win = TestWindow::open_managed("IAPETUS-WAIT-PROBE window");
+
+    let hit = v1::Action {
+        kind: Some(Kind::WaitFor(v1::WaitFor {
+            mode: v1::WaitMode::WindowAppears as i32,
+            timeout_ms: 5000,
+            window_title_regex: Some("^IAPETUS-WAIT-PROBE".into()),
+        })),
+    };
+    let r = d.execute(&hit).unwrap();
+    let Some(v1::action_result::Value::Wait(w)) = r.value else { panic!() };
+    assert!(w.satisfied, "the mapped window was not found by title");
+    assert!(w.window.unwrap().title.contains("IAPETUS-WAIT-PROBE"));
+}
+
+#[test]
+fn wait_for_screen_stable_settles_on_a_quiet_screen() {
+    require_x11!();
+
+    use iapetusd::dispatch::Dispatcher;
+    use iapetusd::frame::FrameSource;
+    use iapetus_proto::v1::{self, action::Kind};
+
+    // A bare root with nothing animating is stable, so the wait returns well
+    // before its timeout. This is the case an agent relies on after app.launch:
+    // wait for the screen to stop changing before it reads it.
+    let display = X11Display::open().expect("no display");
+    let d = Dispatcher::new(FrameSource::new(Box::new(display)), Box::new(X11Input::open().expect("XTEST")));
+
+    let a = v1::Action {
+        kind: Some(Kind::WaitFor(v1::WaitFor {
+            mode: v1::WaitMode::ScreenStable as i32,
+            timeout_ms: 8000,
+            window_title_regex: None,
+        })),
+    };
+    let start = Duration::from_millis(0);
+    let t0 = std::time::Instant::now();
+    let r = d.execute(&a).unwrap();
+    let _ = start;
+    assert!(t0.elapsed() < Duration::from_secs(6), "a quiet screen took too long to settle");
+    let Some(v1::action_result::Value::Wait(w)) = r.value else { panic!() };
+    assert!(w.satisfied, "a quiet screen never reported stable");
 }

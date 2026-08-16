@@ -23,6 +23,7 @@ serde_json = "1.0.151"
 tokio-tungstenite.workspace = true
 futures-util = { version = "0.3.34", default-features = false, features = ["sink", "std"] }
 jpeg-encoder = { version = "0.6.1", features = ["simd"] }
+regex = "1.13.1"
 
 # libc is used by the always-compiled unix process backend (setsid, group
 # kill) and by the x11 SHM capture path, so it belongs on the target rather

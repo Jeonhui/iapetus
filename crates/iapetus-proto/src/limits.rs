@@ -59,6 +59,18 @@ pub const TIMEOUT_ACT_MS: (u32, u32) = (30_000, 120_000);
 pub const TIMEOUT_SHELL_MS: (u32, u32) = (30_000, 300_000);
 pub const TIMEOUT_WAIT_FOR_MS: (u32, u32) = (10_000, 120_000);
 
+/// §6.3 `screen_stable`: two consecutive frames are "stable" when fewer than
+/// this fraction of pixels differ. Not zero, because a blinking cursor or an
+/// antialiased clock second never settles to identical (§15.3), and an agent
+/// waiting for the screen to stop would then wait out its whole timeout on a
+/// screen that is, for its purposes, still.
+pub const SCREEN_STABLE_MAX_CHANGED: f64 = 0.002; // 0.2% of pixels
+
+/// How often the wait loops sample the screen or the window list. Fast enough
+/// that a wait returns promptly once the condition holds, slow enough that an
+/// idle wait is not a busy loop.
+pub const WAIT_POLL_MS: u64 = 150;
+
 /// Lease lifetime is derived, never stated twice.
 ///
 /// §8.4 fixes it at three heartbeat intervals, matching §5.6's "reclaim after
