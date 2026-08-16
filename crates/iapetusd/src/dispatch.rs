@@ -38,6 +38,10 @@ pub enum DispatchError {
     NoDriver(&'static str),
     #[error("no catalog entry for `{0}`; launch it by command instead (§5.5)")]
     UnknownAppKey(String),
+    #[error("package manager `{0}` is not available on this OS")]
+    UnsupportedManager(String),
+    #[error("invalid package name `{0}`")]
+    InvalidPackage(String),
 }
 
 impl DispatchError {
@@ -58,11 +62,54 @@ impl DispatchError {
             // Reporting an authority failure for a missing shortcut would send
             // the caller to the policy engine over a typo.
             DispatchError::UnknownAppKey(_) => "EXEC_FAILED",
+            DispatchError::UnsupportedManager(_) => "UNSUPPORTED_ON_OS",
+            DispatchError::InvalidPackage(_) => "INVALID_PATH",
         }
     }
 }
 
 pub type Result<T> = std::result::Result<T, DispatchError>;
+
+/// Builds the shell command for an `app.install`.
+///
+/// Only `apt` exists on this OS (§16 Phase 1 is Linux). `winget`/`msi`/`brew`
+/// are other platforms and are refused as unsupported here rather than run as a
+/// missing binary, so the agent gets "not on this OS" and not a shell error.
+fn install_command(req: &v1::AppInstall) -> Result<String> {
+    let source = req.source.as_ref().ok_or(DispatchError::Empty)?;
+    match req.manager.as_str() {
+        "apt" => match source {
+            v1::app_install::Source::Package(pkg) => {
+                // A package name, not a command line. Validating it keeps a
+                // stray `; rm -rf` from riding in on the name — not a privilege
+                // boundary (the agent is already root, §7.3) but a guard against
+                // a typo running as a command.
+                if !is_valid_package(pkg) {
+                    return Err(DispatchError::InvalidPackage(pkg.clone()));
+                }
+                // noninteractive so a postinst prompt cannot hang the queue;
+                // `--` so a name starting with a dash is not read as a flag.
+                Ok(format!(
+                    "DEBIAN_FRONTEND=noninteractive apt-get install -y -- {pkg}"
+                ))
+            }
+            // A direct download install (.deb by URL) is a v1 gap, called out
+            // rather than half-done.
+            v1::app_install::Source::Url(_) => {
+                Err(DispatchError::NotImplemented("app.install from a url"))
+            }
+        },
+        other => Err(DispatchError::UnsupportedManager(other.to_string())),
+    }
+}
+
+/// Debian package names: start alphanumeric, then alphanumerics and `. + - :`.
+fn is_valid_package(name: &str) -> bool {
+    let mut chars = name.chars();
+    matches!(chars.next(), Some(c) if c.is_ascii_alphanumeric())
+        && name.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '+' | '-' | ':' | '_'))
+        && name.len() <= 200
+}
 
 fn button(b: i32) -> Button {
     match v1::MouseButton::try_from(b) {
@@ -359,7 +406,32 @@ impl Dispatcher {
                     window,
                 }))
             }
-            Kind::AppInstall(_) => return Err(DispatchError::NotImplemented("app.install")),
+            Kind::AppInstall(req) => {
+                let process = self.process.as_ref().ok_or(DispatchError::NoDriver("app.install"))?;
+                let command = install_command(req)?;
+                // Installing writes to /usr and /opt and needs root; §7.3's
+                // OWNER mode is what makes that ordinary rather than a privilege
+                // escalation. A generous timeout — packages pull dependencies —
+                // capped at the shell ceiling.
+                let spec = LaunchSpec {
+                    command,
+                    args: Vec::new(),
+                    cwd: None,
+                    elevated: true,
+                };
+                let out = process.run(
+                    &spec,
+                    Duration::from_millis(u64::from(limits::TIMEOUT_SHELL_MS.1)),
+                    limits::SHELL_OUTPUT_MAX_BYTES,
+                )?;
+                self.mark_input();
+                Some(v1::action_result::Value::Shell(v1::ShellResult {
+                    exit_code: out.exit_code,
+                    stdout: String::from_utf8_lossy(&out.stdout).into_owned(),
+                    stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
+                    truncated: out.truncated,
+                }))
+            }
             Kind::ShellExec(req) => {
                 let process = self.process.as_ref().ok_or(DispatchError::NoDriver("shell.exec"))?;
                 // §8.2: default 30s, clamped to the 300s ceiling. A zero from an
@@ -898,6 +970,66 @@ mod tests {
             wait_for_window: None,
         }));
         assert!(d.execute(&a).is_err());
+    }
+
+    fn install(manager: &str, source: v1::app_install::Source) -> v1::Action {
+        launch_action(Kind::AppInstall(v1::AppInstall {
+            manager: manager.into(),
+            source: Some(source),
+        }))
+    }
+
+    #[test]
+    fn app_install_builds_a_noninteractive_apt_command() {
+        let (d, proc) = app_dispatcher();
+        let r = d
+            .execute(&install("apt", v1::app_install::Source::Package("ripgrep".into())))
+            .expect("install failed");
+        assert!(r.ok);
+        // The fake process echoes the command it was handed; assert the shape.
+        let cmd = &proc.launched()[0].command;
+        assert!(cmd.contains("apt-get install -y"), "not an apt install: {cmd}");
+        assert!(cmd.contains("noninteractive"), "a prompt could hang the queue: {cmd}");
+        assert!(cmd.ends_with("ripgrep"), "package not at the end after --: {cmd}");
+        assert!(proc.launched()[0].elevated, "install must run elevated");
+    }
+
+    #[test]
+    fn app_install_rejects_a_package_name_carrying_a_command() {
+        // Not a privilege boundary — the agent is already root (§7.3) — but a
+        // name like `x; rm -rf /` must not ride in as a shell command.
+        let (d, _) = app_dispatcher();
+        for bad in ["ripgrep; rm -rf /", "$(reboot)", "a b", "--foo", ""] {
+            let e = d
+                .execute(&install("apt", v1::app_install::Source::Package(bad.into())))
+                .unwrap_err();
+            assert!(
+                matches!(e, DispatchError::InvalidPackage(_) | DispatchError::Empty),
+                "{bad:?} was accepted as a package name"
+            );
+        }
+    }
+
+    #[test]
+    fn app_install_refuses_a_manager_that_is_not_on_this_os() {
+        // winget/msi/brew are other platforms; refuse as unsupported rather
+        // than run a missing binary and report a confusing shell error.
+        let (d, _) = app_dispatcher();
+        for mgr in ["winget", "msi", "brew"] {
+            let e = d
+                .execute(&install(mgr, v1::app_install::Source::Package("vlc".into())))
+                .unwrap_err();
+            assert_eq!(e.code(), "UNSUPPORTED_ON_OS", "{mgr} was not refused as unsupported");
+        }
+    }
+
+    #[test]
+    fn app_install_from_a_url_is_reported_as_not_yet_supported() {
+        let (d, _) = app_dispatcher();
+        let e = d
+            .execute(&install("apt", v1::app_install::Source::Url("http://x/a.deb".into())))
+            .unwrap_err();
+        assert!(matches!(e, DispatchError::NotImplemented(_)));
     }
 
     #[test]

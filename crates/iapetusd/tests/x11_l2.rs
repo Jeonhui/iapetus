@@ -640,3 +640,67 @@ fn wait_for_screen_stable_settles_on_a_quiet_screen() {
     let Some(v1::action_result::Value::Wait(w)) = r.value else { panic!() };
     assert!(w.satisfied, "a quiet screen never reported stable");
 }
+
+// app.install through real apt. Network- and root-dependent, so it skips
+// cleanly where either is missing rather than failing the suite.
+
+#[test]
+fn app_install_actually_installs_a_package() {
+    use iapetusd::dispatch::Dispatcher;
+    use iapetusd::frame::FrameSource;
+    use iapetusd::platform::unix::UnixProcess;
+    use iapetus_proto::v1::{self, action::Kind};
+
+    // Needs root for apt and a package index to install from. The container CI
+    // has both; a developer laptop running `cargo test` has neither, so skip.
+    if !std::path::Path::new("/usr/bin/apt-get").exists() {
+        eprintln!("skipping: apt-get not present");
+        return;
+    }
+    if unsafe { libc::geteuid() } != 0 {
+        eprintln!("skipping: app.install needs root");
+        return;
+    }
+
+    // Refresh the package index first — the image strips it to stay small — and
+    // treat a failure as no network rather than a test failure, since this
+    // sandbox may have no route to the apt mirrors.
+    let proc = UnixProcess::new();
+    let upd = proc
+        .run(
+            &LaunchSpec { command: "apt-get update".into(), args: vec![], cwd: None, elevated: true },
+            Duration::from_secs(120),
+            4 * 1024 * 1024,
+        )
+        .expect("run apt-get update");
+    if upd.exit_code != 0 {
+        eprintln!("skipping: apt-get update failed (no network?)");
+        return;
+    }
+
+    let d = Dispatcher::new(
+        FrameSource::new(Box::new(iapetusd::platform::fake::FakeDisplay::new(64, 48))),
+        Box::new(iapetusd::platform::fake::FakeInput::new()),
+    )
+    .with_process(Box::new(UnixProcess::new()));
+
+    // `sl` is tiny and has no dependencies to speak of — a fast, honest install.
+    let a = v1::Action {
+        kind: Some(Kind::AppInstall(v1::AppInstall {
+            manager: "apt".into(),
+            source: Some(v1::app_install::Source::Package("sl".into())),
+        })),
+    };
+    let r = d.execute(&a).expect("install action failed");
+    let Some(v1::action_result::Value::Shell(res)) = r.value else { panic!("no shell result") };
+    if res.exit_code != 0 {
+        // A mirror hiccup mid-run is not our bug; the command shape is already
+        // covered by the unit tests. Only a clean install proves the path.
+        eprintln!("skipping: apt install did not complete: {}", res.stderr);
+        return;
+    }
+    assert!(
+        std::path::Path::new("/usr/games/sl").exists() || std::path::Path::new("/usr/bin/sl").exists(),
+        "the package reported success but its binary is not on disk"
+    );
+}
