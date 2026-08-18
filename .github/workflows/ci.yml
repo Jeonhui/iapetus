@@ -1,0 +1,33 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      # The x11 L2 tests need a live X server and run in the container image;
+      # these are the workspace tests and lints that need no display.
+      - name: Test
+        run: cargo test --workspace
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+  # The L2 suite the spec calls the most important layer (§15.2): the real X11
+  # drivers against a live X server, built and run inside the test image.
+  l2:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build the L2 test image
+        run: docker build -f images/linux-base/Dockerfile.test -t iapetus-l2 .
+      - name: Run L2
+        run: docker run --rm iapetus-l2

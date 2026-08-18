@@ -58,6 +58,23 @@ curl -s -X POST http://localhost:8090/v1/tokens \
        "actor":{"type":"human","id":"you"},"control":"write"}'
 ```
 
+## Run without building (published image)
+
+Once a release is tagged, the image is published to the GitHub Container
+Registry, so others can run it with no build step:
+
+```bash
+docker pull ghcr.io/jeonhui/iapetus:latest
+IMAGE=ghcr.io/jeonhui/iapetus:latest docker compose up
+```
+
+The compose file uses `${IMAGE:-iapetus:dev}`, so setting `IMAGE` points every
+service at the published image; unset, it builds locally as before.
+
+> The repository is currently private, so its GHCR package is private too —
+> pulling needs access to the repo, or the package made public in the repo's
+> Packages settings. Making the repo public publishes the image publicly.
+
 ## Without Docker
 
 Docker is a convenience, not a requirement — it is the easiest way to get a

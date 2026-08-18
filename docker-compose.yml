@@ -19,7 +19,7 @@ services:
     build:
       context: .
       dockerfile: images/linux-base/Dockerfile
-    image: iapetus:dev
+    image: ${IMAGE:-iapetus:dev}
     command: iapetus-controlplane
     environment:
       IAPETUS_CP_BIND: 0.0.0.0:8090
@@ -28,7 +28,7 @@ services:
       - "8090:8090"
 
   gateway:
-    image: iapetus:dev
+    image: ${IMAGE:-iapetus:dev}
     command: iapetus-gateway
     environment:
       IAPETUS_GATEWAY_BIND: 0.0.0.0:8080
@@ -41,7 +41,7 @@ services:
       - controlplane
 
   desktop:
-    image: iapetus:dev
+    image: ${IMAGE:-iapetus:dev}
     command: /usr/local/bin/compose-desktop.sh
     environment:
       DISPLAY: ":1"
