@@ -8,7 +8,7 @@
  * this is a thin wrapper on `fetch`, with no dependencies.
  *
  * ```ts
- * import { Iapetus } from "@iapetus/sdk";
+ * import { Iapetus } from "iapetus-sdk";
  *
  * const client = new Iapetus({ apiKey: "sk_iap_live_..." });
  *

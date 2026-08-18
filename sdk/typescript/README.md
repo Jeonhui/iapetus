@@ -1,13 +1,17 @@
-# Iapetus TypeScript SDK
+# Iapetus SDK for JavaScript & TypeScript
 
 A thin, dependency-free client for [Iapetus](../../README.md) — a persistent
 virtual desktop an agent and a human co-own. Uses only the runtime's built-in
 `fetch`, so it runs on Node 18+ and in the browser with nothing to install.
 
+**One package, both languages.** It is written in TypeScript and ships compiled
+JavaScript plus type declarations, so JavaScript users `import` it directly and
+TypeScript users also get full types — no separate JS build to maintain.
+
 ## Install
 
 ```bash
-npm install @iapetus/sdk       # or: npm install ./sdk/typescript
+npm install iapetus-sdk       # or: npm install ./sdk/typescript
 ```
 
 ## Use
@@ -15,7 +19,7 @@ npm install @iapetus/sdk       # or: npm install ./sdk/typescript
 Start the stack (`docker compose up --build`), then:
 
 ```ts
-import { Iapetus } from "@iapetus/sdk";
+import { Iapetus } from "iapetus-sdk";
 
 const client = new Iapetus({ apiKey: "sk_iap_live_demo" });
 

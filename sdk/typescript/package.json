@@ -1,5 +1,5 @@
 {
-  "name": "@iapetus/sdk",
+  "name": "iapetus-sdk",
   "version": "0.1.0",
   "description": "TypeScript SDK for Iapetus \u2014 a persistent virtual desktop for AI agents",
   "type": "module",
@@ -26,5 +26,13 @@
   "devDependencies": {
     "typescript": "^5.4.0",
     "@types/node": "^20.0.0"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/Jeonhui/iapetus.git",
+    "directory": "sdk/typescript"
   }
 }

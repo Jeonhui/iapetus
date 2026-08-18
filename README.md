@@ -35,7 +35,7 @@ lease change hands.
 ### Drive it from Python
 
 ```python
-from iapetus import Iapetus                       # pip install ./sdk/python
+from iapetus import Iapetus                       # pip install iapetus-sdk
 
 client = Iapetus(api_key="sk_iap_live_demo")
 print(client.viewer_url("dsk_1", user_id="you"))  # a URL a person opens to watch
@@ -46,7 +46,7 @@ with client.session("dsk_1", gateway_token="dev-write") as c:
     png = c.screenshot()                          # PNG bytes of the live screen
 ```
 
-SDKs for [Python](sdk/python) and [TypeScript](sdk/typescript) — same surface.
+SDKs for [Python](sdk/python) (`pip install iapetus-sdk`) and [JavaScript/TypeScript](sdk/typescript) (`npm install iapetus-sdk`) — same surface.
 
 The control plane is at <http://localhost:8090>. Mint a real token against it:
 
