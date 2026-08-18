@@ -71,9 +71,8 @@ IMAGE=ghcr.io/jeonhui/iapetus:latest docker compose up
 The compose file uses `${IMAGE:-iapetus:dev}`, so setting `IMAGE` points every
 service at the published image; unset, it builds locally as before.
 
-> The repository is currently private, so its GHCR package is private too —
-> pulling needs access to the repo, or the package made public in the repo's
-> Packages settings. Making the repo public publishes the image publicly.
+> The image package inherits the repository's visibility. If a pull is denied,
+> make the `iapetus` package public in the repository's Packages settings.
 
 ## Without Docker
 
