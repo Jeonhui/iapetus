@@ -4,12 +4,10 @@ on:
   push:
     tags: ['v*']
 
-env:
-  IMAGE: ghcr.io/${{ github.repository }}
-
 jobs:
   build:
     strategy:
+      fail-fast: false
       matrix:
         include:
           - platform: linux/amd64
@@ -22,6 +20,10 @@ jobs:
       packages: write
     steps:
       - uses: actions/checkout@v4
+      # GHCR requires a lowercase repository name; github.repository can carry
+      # capitals (Jeonhui/iapetus), so lowercase it into an env var both jobs use.
+      - name: Lowercase image name
+        run: echo "IMAGE=ghcr.io/${GITHUB_REPOSITORY,,}" >> "$GITHUB_ENV"
       - uses: docker/setup-buildx-action@v3
       - uses: docker/login-action@v3
         with:
@@ -60,6 +62,8 @@ jobs:
           path: /tmp/digests
           pattern: digest-*
           merge-multiple: true
+      - name: Lowercase image name
+        run: echo "IMAGE=ghcr.io/${GITHUB_REPOSITORY,,}" >> "$GITHUB_ENV"
       - uses: docker/login-action@v3
         with:
           registry: ghcr.io
