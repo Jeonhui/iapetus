@@ -739,9 +739,15 @@ impl App {
         // the SDK and the parent-app demo mint — works too. Accepting both is a
         // development convenience; a production gateway sets a JWKS and issues no
         // shared secrets, so only signed tokens pass.
+        // A shared secret matches only when it is non-empty: a production gateway
+        // disables the dev secrets by setting them empty, forcing JWT-only.
         match token {
-            Some(t) if t == self.write_token => return Some(Control::Write),
-            Some(t) if t == self.view_token => return Some(Control::Read),
+            Some(t) if !self.write_token.is_empty() && t == self.write_token => {
+                return Some(Control::Write)
+            }
+            Some(t) if !self.view_token.is_empty() && t == self.view_token => {
+                return Some(Control::Read)
+            }
             _ => {}
         }
         let jwks = self.jwks.as_ref()?;
@@ -763,7 +769,7 @@ impl App {
         // The guest registers with the ingest secret (§19.6's SRTP key stands
         // in as this), and where a JWKS is configured a real Guest Token is
         // also accepted — so a dev desktop and a production one both attach.
-        if token == Some(self.ingest_token.as_str()) {
+        if !self.ingest_token.is_empty() && token == Some(self.ingest_token.as_str()) {
             return true;
         }
         let Some(jwks) = &self.jwks else { return false };
@@ -870,8 +876,19 @@ mod tests {
             });
         assert_eq!(a.control_for(Some(&forged)), None, "a token signed by the wrong key was accepted");
 
-        // The dev shared secret is not a JWT, so once a JWKS is set it is refused.
-        assert_eq!(a.control_for(Some("drive")), None);
+        // This build accepts the dev shared secret alongside JWTs, so the simple
+        // quickstart (?token=dev-write) and a real JWT both work against one
+        // gateway.
+        assert_eq!(a.control_for(Some("drive")), Some(Control::Write));
+
+        // Production forces JWT-only by clearing the shared secrets; an empty
+        // secret never matches, so only signed tokens pass then.
+        let mut prod = a;
+        prod.write_token.clear();
+        prod.view_token.clear();
+        assert_eq!(prod.control_for(Some("drive")), None);
+        assert_eq!(prod.control_for(Some("")), None);
+        assert_eq!(prod.control_for(Some(&writer)), Some(Control::Write), "JWT still works");
     }
 
     #[test]
