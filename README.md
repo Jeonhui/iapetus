@@ -35,7 +35,7 @@ lease change hands.
 ### Drive it from Python
 
 ```python
-from iapetus import Iapetus                       # pip install iapetus-sdk
+from iapetus import Iapetus                       # pip install ./sdk/python
 
 client = Iapetus(api_key="sk_iap_live_demo")
 print(client.viewer_url("dsk_1", user_id="you"))  # a URL a person opens to watch
@@ -46,7 +46,7 @@ with client.session("dsk_1", gateway_token="dev-write") as c:
     png = c.screenshot()                          # PNG bytes of the live screen
 ```
 
-SDKs for [Python](sdk/python) (`pip install iapetus-sdk`) and [JavaScript/TypeScript](sdk/typescript) (`npm install iapetus-sdk`) — same surface.
+SDKs for [Python](sdk/python) (`pip install ./sdk/python`) and [JavaScript/TypeScript](sdk/typescript) (`npm install iapetus-sdk`) — same surface.
 
 The control plane is at <http://localhost:8090>. Mint a real token against it:
 
@@ -201,13 +201,15 @@ Implemented and tested end to end:
 - The control lease (§5.6): human-preempts-agent, no queue between peers,
   idle handover, key release on handover
 - Token issuance, refresh, revocation, and verification (§8.1)
+- SDKs for Python and JavaScript/TypeScript that drive a desktop through the
+  gateway's action path. The JS/TS package is published to npm as `iapetus-sdk`
+  (`npm install iapetus-sdk`); the Python package is ready to publish to PyPI
 
 Not yet built:
 
 - Desktop provisioning (Firecracker microVMs) and the scheduler (§12.4, §19.2)
 - The WebRTC media path — the default; today's stream is the §6.3 fallback
 - The rest of the REST API: desktops, policy, webhooks, event stream (§8.4)
-- Desktop provisioning, the WebRTC path, and the rest of the REST API above
 
 ## License
 
